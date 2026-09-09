@@ -19,7 +19,7 @@ lab peer       10.231.0.1
 
 It generates throwaway client/server keys and stores them below the ignored `.lab/` directory. It never reads or changes a production WireGuard profile.
 
-The helper deliberately refuses to touch an already-existing `wg-waker-lab` interface.
+If IPFW is enabled, the helper also installs temporary rule `90` allowing only `10.231.0.0/24` traffic via `wg-waker-lab`; the rule is required for the synthetic inbound TCP services on GhostBSD. The helper refuses to run if rule `90` or the `wg-waker-lab` interface already exists, and teardown removes only the marked lab rule/interface.
 
 ## Start the lab peer
 
@@ -73,6 +73,15 @@ cargo run -p waker-app --bin waker
 
 Press **Wake**. A successful trace should show the private TCP connection to the fake FRITZ, the WOL request, one or more failed PC probes during the artificial delay, then a successful probe.
 
+For an automated non-GUI end-to-end run against the same live lab:
+
+```sh
+WAKER_LAB_PROFILE="$PWD/.lab/waker-lab.conf" \
+  cargo test -p waker-net --test local_lab -- --ignored --nocapture
+```
+
+This test is ignored during normal `cargo test --workspace` runs because it requires the temporary kernel WireGuard peer and fake services.
+
 For packet-level diagnosis, the two useful capture points are:
 
 ```sh
@@ -88,7 +97,7 @@ sudo tcpdump -ni wg-waker-lab
 sudo ./scripts/lab-down-freebsd.sh
 ```
 
-The teardown helper only destroys the exact interface recorded by the Waker lab marker. It then removes the generated throwaway keys/configuration.
+The teardown helper removes only the marked lab IPFW rule (when one was installed), destroys the exact interface recorded by the Waker lab marker, and then removes the generated throwaway keys/configuration.
 
 ## Why this lab exists
 

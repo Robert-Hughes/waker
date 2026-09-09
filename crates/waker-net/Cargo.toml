@@ -17,5 +17,8 @@ tokio.workspace = true
 tracing.workspace = true
 waker-core = { path = "../waker-core" }
 
+[dev-dependencies]
+tracing-subscriber.workspace = true
+
 [lints]
 workspace = true

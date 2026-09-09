@@ -23,7 +23,7 @@ rand = "0.9.2"
 serde = { version = "1.0.226", features = ["derive"] }
 smoltcp = { version = "0.14.0", default-features = false, features = ["medium-ip", "proto-ipv4", "socket-tcp", "std"] }
 thiserror = "2.0.16"
-tokio = { version = "1.52.0", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.52.0", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
 winit = { version = "0.30.13", default-features = false, features = ["android-native-activity", "rwh_06", "wayland", "x11"] }

@@ -47,7 +47,14 @@ async fn run_fake_fritz(
 ) -> std::io::Result<()> {
     let listener = TcpListener::bind(bind).await?;
     loop {
-        let (mut stream, peer) = listener.accept().await?;
+        let (mut stream, peer) = match listener.accept().await {
+            Ok(connection) => connection,
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionAborted => {
+                warn!(%error, "fake FRITZ accept aborted; continuing");
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         let awake_tx = awake_tx.clone();
         tokio::spawn(async move {
             let mut request = Vec::new();
@@ -115,7 +122,14 @@ async fn run_fake_pc(bind: SocketAddr, mut awake: watch::Receiver<bool>) -> std:
     let listener = TcpListener::bind(bind).await?;
     info!(%bind, "fake PC probe port listening");
     loop {
-        let (mut stream, peer) = listener.accept().await?;
+        let (mut stream, peer) = match listener.accept().await {
+            Ok(connection) => connection,
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionAborted => {
+                warn!(%error, "fake PC accept aborted; continuing");
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         info!(%peer, "fake PC probe connected");
         let _ = stream.shutdown().await;
     }

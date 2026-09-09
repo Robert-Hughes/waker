@@ -1,7 +1,8 @@
 use std::{
     io,
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4},
     str::FromStr,
+    sync::Arc,
     time::Duration,
 };
 
@@ -11,6 +12,7 @@ use gotatun::{
     device::{DeviceBuilder, Peer},
     packet::{Ip, Packet, PacketBufPool},
     tun::{IpRecv, IpSend, MtuWatcher},
+    udp::{UdpRecv, UdpSend, UdpTransportFactory, UdpTransportFactoryParams},
     x25519::{PublicKey, StaticSecret},
 };
 use ipnetwork::{IpNetwork, Ipv4Network};
@@ -179,6 +181,72 @@ pub enum NetError {
     WorkerStopped,
 }
 
+// GotaTun normally requests a dual-stack outer UDP socket. FreeBSD rejects the
+// resulting IPv4-mapped send path with EAFNOSUPPORT, so Waker binds the same
+// address family as the resolved WireGuard peer instead.
+#[derive(Clone, Copy)]
+struct WakerUdpFactory {
+    endpoint_ip: IpAddr,
+}
+
+impl WakerUdpFactory {
+    const fn new(endpoint: SocketAddr) -> Self {
+        Self {
+            endpoint_ip: endpoint.ip(),
+        }
+    }
+}
+
+impl UdpTransportFactory for WakerUdpFactory {
+    type Send = WakerUdpSocket;
+    type Recv = WakerUdpSocket;
+
+    async fn bind(
+        &mut self,
+        params: &UdpTransportFactoryParams,
+    ) -> io::Result<(Self::Send, Self::Recv)> {
+        let bind_ip = params.addr.unwrap_or(match self.endpoint_ip {
+            IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        });
+        let socket = tokio::net::UdpSocket::bind(SocketAddr::new(bind_ip, params.port)).await?;
+        let socket = WakerUdpSocket {
+            inner: Arc::new(socket),
+        };
+        debug!(address = %socket.inner.local_addr()?, "bound Waker WireGuard UDP socket");
+        Ok((socket.clone(), socket))
+    }
+}
+
+#[derive(Clone)]
+struct WakerUdpSocket {
+    inner: Arc<tokio::net::UdpSocket>,
+}
+
+impl UdpSend for WakerUdpSocket {
+    type SendManyBuf = ();
+
+    async fn send_to(&self, packet: Packet, destination: SocketAddr) -> io::Result<()> {
+        self.inner.send_to(&packet, destination).await?;
+        Ok(())
+    }
+
+    fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
+        self.inner.local_addr().map(Some)
+    }
+}
+
+impl UdpRecv for WakerUdpSocket {
+    type RecvManyBuf = ();
+
+    async fn recv_from(&mut self, pool: &mut PacketBufPool) -> io::Result<(Packet, SocketAddr)> {
+        let mut packet = pool.get();
+        let (length, source) = self.inner.recv_from(&mut packet).await?;
+        packet.truncate(length);
+        Ok((packet, source))
+    }
+}
+
 struct GotaIpSend {
     incoming: mpsc::UnboundedSender<Vec<u8>>,
 }
@@ -186,6 +254,10 @@ struct GotaIpSend {
 impl IpSend for GotaIpSend {
     async fn send(&mut self, packet: Packet<Ip>) -> io::Result<()> {
         let raw: Packet<[u8]> = packet.into();
+        trace!(
+            len = raw.as_ref().len(),
+            "GotaTun delivered decrypted IP packet to smoltcp"
+        );
         self.incoming
             .send(raw.as_ref().to_vec())
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "smoltcp channel closed"))
@@ -204,6 +276,10 @@ impl IpRecv for GotaIpRecv {
         let bytes = self.outgoing.recv().await.ok_or_else(|| {
             io::Error::new(io::ErrorKind::UnexpectedEof, "smoltcp channel closed")
         })?;
+        trace!(
+            len = bytes.len(),
+            "GotaTun consumed outbound IP packet from smoltcp"
+        );
         let raw: Packet<[u8]> = Packet::copy_from(bytes.as_slice());
         let parsed = raw.try_into_ipvx().map_err(|error| {
             io::Error::new(
@@ -249,6 +325,7 @@ impl TxToken for SmolTxToken {
     {
         let mut buffer = vec![0_u8; len];
         let result = f(&mut buffer);
+        trace!(len, "smoltcp emitted outbound IP packet");
         let _ = self.outgoing.send(buffer);
         result
     }
@@ -534,7 +611,7 @@ impl TunnelClient {
         }
 
         let device = DeviceBuilder::new()
-            .with_default_udp()
+            .with_udp(WakerUdpFactory::new(endpoint))
             .with_ip_pair(ip_send, ip_recv)
             .with_private_key(StaticSecret::from(profile.private_key))
             .with_peer(peer)
