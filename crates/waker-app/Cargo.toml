@@ -1,0 +1,36 @@
+[package]
+name = "waker-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "waker_app"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "waker"
+path = "src/main.rs"
+
+[dependencies]
+eframe.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+waker-core = { path = "../waker-core" }
+waker-net = { path = "../waker-net" }
+winit.workspace = true
+
+[package.metadata.android]
+package = "app.waker.android"
+build_targets = ["aarch64-linux-android"]
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.INTERNET"
+
+[package.metadata.android.application]
+label = "Waker"
+
+[lints]
+workspace = true

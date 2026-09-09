@@ -1,0 +1,21 @@
+[package]
+name = "waker-net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+base64.workspace = true
+gotatun.workspace = true
+ipnetwork.workspace = true
+rand.workspace = true
+smoltcp.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+waker-core = { path = "../waker-core" }
+
+[lints]
+workspace = true

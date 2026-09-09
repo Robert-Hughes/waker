@@ -1,0 +1,8 @@
+/target
+*.log
+*.pcap
+*.pcapng
+/config.local.toml
+/waker.local.conf
+/.lab
+.DS_Store
