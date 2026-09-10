@@ -102,11 +102,26 @@ cargo run -p waker-lab
 
 ## Android
 
-The Android application is also pure Rust. `waker-app` builds as a `cdylib`, uses winit's `NativeActivity` backend through eframe, and requests only normal internet access. It does **not** request Android VPN permission.
+The Android application is pure Rust. `waker-app` builds as a `cdylib`, uses winit's `NativeActivity` backend through eframe, and requests only normal internet access. It does **not** request Android VPN permission.
 
-The Cargo manifest is prepared for `cargo-apk` with display name **Waker** and package name `app.waker.android`.
+The Cargo manifest uses display name **Waker** and package name `app.waker.android`. On Example-PC, the tested native-FreeBSD Android workflow is documented in `host-specific Android build notes`; a debug APK can be built with:
 
-The current GhostBSD development machine does not yet have an Android SDK/NDK, `cargo-apk`, or the `aarch64-linux-android` Rust target installed, so APK compilation has not yet been performed here. Android configuration import/persistent secret storage is intentionally not implemented yet; the shared networking core is complete independently of that platform plumbing.
+```sh
+cargo-apk2 \
+  build -p waker-app --lib --target aarch64-linux-android
+```
+
+APK compilation, alignment, debug signing and manifest verification have passed. Physical install/launch and Android runtime diagnostics remain to be accepted on the Android test device when the phone is available.
+
+## Diagnostics and reporting
+
+Each wake attempt has an ID and elapsed time. The normal UI presents concise progress (`Connecting`, wake request, numbered PC probes), a friendly terminal success/failure, and a collapsible technical **Details** section for failures. Unexpected worker/runtime shutdowns are converted into terminal runtime failures rather than leaving the UI permanently busy.
+
+Waker also writes a persistent diagnostic event stream. The default log level is `debug`; set `WAKER_LOG=trace` for packet-level Waker tracing, or `info`, `warn`, or `error` to reduce detail. Persistent logs contain only Waker's own tracing targets, not arbitrary dependency logs. The background writer is non-lossy: if its bounded queue is ever saturated, Waker applies backpressure rather than silently dropping diagnostic events.
+
+Desktop logs are written under `$XDG_STATE_HOME/waker/logs`, or `~/.local/state/waker/logs` when `XDG_STATE_HOME` is unset, and are mirrored to stderr. The desktop diagnostics directory is forced to mode `0700`. Android logs are written under the app-private internal data directory and mirrored to Android logcat with tag `Waker`. Logs rotate daily with at most seven files retained.
+
+The in-app **Diagnostics** panel shows the last attempt, persistent-log status, and a recent log tail. **Copy diagnostics** copies a sanitised bundle suitable for troubleshooting. WireGuard private keys and preshared keys are private implementation fields, never deliberately logged, and credential-assignment lines are redacted again when diagnostics are copied.
 
 ## Validation
 
@@ -119,13 +134,11 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-For detailed networking diagnostics:
+For verbose networking diagnostics:
 
 ```sh
-RUST_LOG=waker=trace cargo run -p waker-app --bin waker
+WAKER_LOG=trace cargo run -p waker-app --bin waker
 ```
-
-WireGuard private keys and preshared keys are never emitted to tracing output.
 
 ## Security model
 

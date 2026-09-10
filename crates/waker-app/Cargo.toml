@@ -17,10 +17,14 @@ path = "src/main.rs"
 eframe.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+tracing-appender.workspace = true
 tracing-subscriber.workspace = true
 waker-core = { path = "../waker-core" }
 waker-net = { path = "../waker-net" }
 winit.workspace = true
+
+[target.'cfg(target_os = "android")'.dependencies]
+tracing-logcat = "0.1.0"
 
 [package.metadata.android]
 package = "app.waker.android"

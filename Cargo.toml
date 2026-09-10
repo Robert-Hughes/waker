@@ -25,6 +25,7 @@ smoltcp = { version = "0.14.0", default-features = false, features = ["medium-ip
 thiserror = "2.0.16"
 tokio = { version = "1.52.0", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tracing = "0.1.41"
+tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
 winit = { version = "0.30.13", default-features = false, features = ["android-native-activity", "rwh_06", "wayland", "x11"] }
 

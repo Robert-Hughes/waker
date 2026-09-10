@@ -70,6 +70,69 @@ impl WakeTarget {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WakeFailureStage {
+    Configuration,
+    Connect,
+    WakeRequest,
+    Probe,
+    Timeout,
+    Runtime,
+}
+
+impl WakeFailureStage {
+    #[must_use]
+    pub const fn user_message(self) -> &'static str {
+        match self {
+            Self::Configuration => "Configuration is invalid",
+            Self::Connect => "Could not connect to FRITZ!Box",
+            Self::WakeRequest => "FRITZ!Box did not accept the wake request",
+            Self::Probe => "Could not check whether the PC is awake",
+            Self::Timeout => "PC did not wake in time",
+            Self::Runtime => "Waker could not start the wake operation",
+        }
+    }
+
+    #[must_use]
+    pub const fn log_name(self) -> &'static str {
+        match self {
+            Self::Configuration => "configuration",
+            Self::Connect => "connect",
+            Self::WakeRequest => "wake_request",
+            Self::Probe => "probe",
+            Self::Timeout => "timeout",
+            Self::Runtime => "runtime",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WakeFailure {
+    pub stage: WakeFailureStage,
+    pub detail: String,
+}
+
+impl WakeFailure {
+    #[must_use]
+    pub fn new(stage: WakeFailureStage, detail: impl Into<String>) -> Self {
+        Self {
+            stage,
+            detail: detail.into(),
+        }
+    }
+
+    #[must_use]
+    pub const fn user_message(&self) -> &'static str {
+        self.stage.user_message()
+    }
+}
+
+impl fmt::Display for WakeFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.user_message(), self.detail)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WakeState {
     Idle,
@@ -77,7 +140,7 @@ pub enum WakeState {
     Waking,
     WaitingForPc { attempt: u32 },
     Awake,
-    Failed(String),
+    Failed(WakeFailure),
 }
 
 impl WakeState {
@@ -86,10 +149,10 @@ impl WakeState {
         match self {
             Self::Idle => "Ready".to_owned(),
             Self::Connecting => "Connecting…".to_owned(),
-            Self::Waking => "Waking…".to_owned(),
+            Self::Waking => "Sending wake request…".to_owned(),
             Self::WaitingForPc { attempt } => format!("Waiting for PC… ({attempt})"),
             Self::Awake => "PC awake".to_owned(),
-            Self::Failed(message) => format!("Failed: {message}"),
+            Self::Failed(failure) => format!("Wake failed: {}", failure.user_message()),
         }
     }
 }
@@ -119,12 +182,12 @@ pub trait WakeBackend: Send {
 ///
 /// # Errors
 ///
-/// Returns the first connection, wake, or probe error, or a timeout if the target never becomes reachable.
+/// Returns a stage-aware failure for the first connection, wake, or probe error, or a timeout if the target never becomes reachable.
 pub async fn run_wake<B, F>(
     backend: &mut B,
     target: &WakeTarget,
     mut report: F,
-) -> Result<(), WakeBackendError>
+) -> Result<(), WakeFailure>
 where
     B: WakeBackend,
     F: FnMut(WakeState) + Send,
@@ -132,10 +195,16 @@ where
     report(WakeState::Connecting);
 
     let result = async {
-        backend.connect().await?;
+        backend
+            .connect()
+            .await
+            .map_err(|error| WakeFailure::new(WakeFailureStage::Connect, error.to_string()))?;
 
         report(WakeState::Waking);
-        backend.send_wake(target.mac).await?;
+        backend
+            .send_wake(target.mac)
+            .await
+            .map_err(|error| WakeFailure::new(WakeFailureStage::WakeRequest, error.to_string()))?;
 
         let started = tokio::time::Instant::now();
         let mut attempt = 0_u32;
@@ -143,16 +212,23 @@ where
             attempt = attempt.saturating_add(1);
             report(WakeState::WaitingForPc { attempt });
 
-            if backend.probe(target.probe_address).await? {
+            if backend
+                .probe(target.probe_address)
+                .await
+                .map_err(|error| WakeFailure::new(WakeFailureStage::Probe, error.to_string()))?
+            {
                 report(WakeState::Awake);
                 return Ok(());
             }
 
             if started.elapsed() >= target.probe_timeout {
-                return Err(WakeBackendError::new(format!(
-                    "PC did not become reachable within {} seconds",
-                    target.probe_timeout.as_secs()
-                )));
+                return Err(WakeFailure::new(
+                    WakeFailureStage::Timeout,
+                    format!(
+                        "PC did not become reachable within {} seconds",
+                        target.probe_timeout.as_secs()
+                    ),
+                ));
             }
 
             tokio::time::sleep(target.probe_interval).await;
@@ -163,7 +239,7 @@ where
     backend.disconnect().await;
 
     if let Err(error) = &result {
-        report(WakeState::Failed(error.to_string()));
+        report(WakeState::Failed(error.clone()));
     }
 
     result
@@ -227,5 +303,34 @@ mod tests {
         assert!(backend.disconnected);
         assert_eq!(states.first(), Some(&WakeState::Connecting));
         assert_eq!(states.last(), Some(&WakeState::Awake));
+    }
+
+    #[tokio::test]
+    async fn timeout_failure_reports_timeout_stage() {
+        let mut backend = Backend {
+            probes: VecDeque::from([false]),
+            disconnected: false,
+        };
+        let mut target = WakeTarget::new(
+            "AA:BB:CC:DD:EE:FF".parse().unwrap(),
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 22),
+        );
+        target.probe_interval = Duration::ZERO;
+        target.probe_timeout = Duration::ZERO;
+
+        let mut states = Vec::new();
+        let failure = run_wake(&mut backend, &target, |state| states.push(state))
+            .await
+            .unwrap_err();
+
+        assert!(backend.disconnected);
+        assert_eq!(failure.stage, WakeFailureStage::Timeout);
+        assert!(matches!(
+            states.last(),
+            Some(WakeState::Failed(WakeFailure {
+                stage: WakeFailureStage::Timeout,
+                ..
+            }))
+        ));
     }
 }

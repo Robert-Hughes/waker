@@ -1,10 +1,4 @@
 fn main() -> eframe::Result {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("waker=debug")),
-        )
-        .init();
-
-    waker_app::run_desktop()
+    let diagnostics = waker_app::init_desktop_diagnostics();
+    waker_app::run_desktop(diagnostics)
 }

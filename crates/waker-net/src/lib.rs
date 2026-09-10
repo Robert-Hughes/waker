@@ -38,15 +38,19 @@ const TCP_TX_BUFFER: usize = 16 * 1024;
 #[derive(Clone)]
 pub struct WireGuardProfile {
     pub address: Ipv4Network,
-    pub private_key: [u8; 32],
-    pub peer_public_key: [u8; 32],
-    pub preshared_key: Option<[u8; 32]>,
+    private_key: [u8; 32],
+    peer_public_key: [u8; 32],
+    preshared_key: Option<[u8; 32]>,
     pub endpoint: String,
     pub allowed_ips: Vec<IpNetwork>,
     pub persistent_keepalive: Option<u16>,
 }
 
 impl WireGuardProfile {
+    #[must_use]
+    pub const fn has_preshared_key(&self) -> bool {
+        self.preshared_key.is_some()
+    }
     /// Parse the subset of a WireGuard/wg-quick profile needed by Waker.
     ///
     /// # Errors
@@ -782,6 +786,7 @@ impl WakeBackend for WakerWireGuardBackend {
         }
 
         self.tunnel = Some(tunnel);
+        debug!(target = %self.fritz_address, "FRITZ!Box reachable through WireGuard");
         Ok(())
     }
 
@@ -798,19 +803,24 @@ impl WakeBackend for WakerWireGuardBackend {
                 "FRITZ!Box Wake-on-LAN request returned HTTP {status}"
             )));
         }
+        debug!(status, "FRITZ!Box accepted Wake-on-LAN request");
         Ok(())
     }
 
     async fn probe(&mut self, address: SocketAddrV4) -> Result<bool, WakeBackendError> {
-        self.tunnel()?
+        let reachable = self
+            .tunnel()?
             .probe(address, Duration::from_secs(2))
             .await
-            .map_err(to_backend_error)
+            .map_err(to_backend_error)?;
+        debug!(target = %address, reachable, "PC reachability probe completed");
+        Ok(reachable)
     }
 
     async fn disconnect(&mut self) {
         if let Some(tunnel) = self.tunnel.take() {
             tunnel.shutdown().await;
+            debug!("WireGuard tunnel disconnected");
         }
     }
 }
