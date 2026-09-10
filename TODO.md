@@ -1,0 +1,2 @@
+- Logo
+- PC awake detection - use fritz
