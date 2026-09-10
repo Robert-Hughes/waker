@@ -16,7 +16,9 @@ use std::{
 use diagnostics::{DiagnosticsInfo, recent_log_tail};
 use eframe::egui;
 use tracing::{Instrument, error, info, info_span};
-use waker_core::{MacAddress, WakeFailure, WakeFailureStage, WakeState, WakeTarget, run_wake};
+use waker_core::{
+    MacAddress, WakeBackend, WakeFailure, WakeFailureStage, WakeState, WakeTarget, run_wake,
+};
 use waker_net::{WakerWireGuardBackend, WireGuardProfile};
 
 pub use diagnostics::DiagnosticsRuntime;
@@ -54,6 +56,8 @@ pub struct WakerApp {
     busy: bool,
     active_attempt: Option<ActiveAttempt>,
     last_attempt: Option<AttemptSummary>,
+    status_check_rx: Option<Receiver<Result<bool, String>>>,
+    host_status: Option<Result<bool, String>>,
     diagnostics: DiagnosticsInfo,
     diagnostics_text: String,
 }
@@ -96,6 +100,8 @@ impl WakerApp {
             busy: false,
             active_attempt: None,
             last_attempt: None,
+            status_check_rx: None,
+            host_status: None,
             diagnostics,
             diagnostics_text: String::new(),
         }
@@ -113,11 +119,11 @@ impl WakerApp {
             Ok(job) => {
                 info!(
                     attempt_id,
-                    client_address = %job.profile.address,
-                    endpoint = %job.profile.endpoint,
-                    allowed_routes = job.profile.allowed_ips.len(),
-                    has_preshared_key = job.profile.has_preshared_key(),
-                    fritz_ip = %job.fritz_ip,
+                    client_address = %job.fritz.profile.address,
+                    endpoint = %job.fritz.profile.endpoint,
+                    allowed_routes = job.fritz.profile.allowed_ips.len(),
+                    has_preshared_key = job.fritz.profile.has_preshared_key(),
+                    fritz_ip = %job.fritz.fritz_ip,
                     probe_address = %job.target.probe_address,
                     "wake configuration validated"
                 );
@@ -159,7 +165,41 @@ impl WakerApp {
         }
     }
 
-    fn build_job(&self) -> Result<WakeJob, String> {
+    fn begin_host_status_check(&mut self, ctx: &egui::Context) {
+        if self.busy || self.status_check_rx.is_some() {
+            return;
+        }
+        info!("FRITZ!Box host status check requested");
+
+        match self.build_fritz_job() {
+            Ok(job) => {
+                info!(
+                    client_address = %job.profile.address,
+                    endpoint = %job.profile.endpoint,
+                    allowed_routes = job.profile.allowed_ips.len(),
+                    has_preshared_key = job.profile.has_preshared_key(),
+                    fritz_ip = %job.fritz_ip,
+                    pc_mac = %job.mac,
+                    "host status configuration validated"
+                );
+                let (result_tx, result_rx) = mpsc::channel();
+                self.status_check_rx = Some(result_rx);
+                self.host_status = None;
+                if let Err(error) = spawn_host_status_worker(job, result_tx, ctx.clone()) {
+                    error!(%error, "host status check failed before worker start");
+                    self.status_check_rx = None;
+                    self.host_status =
+                        Some(Err(format!("Could not create worker thread: {error}")));
+                }
+            }
+            Err(message) => {
+                error!(detail = %message, "host status check rejected");
+                self.host_status = Some(Err(message));
+            }
+        }
+    }
+
+    fn build_fritz_job(&self) -> Result<FritzJob, String> {
         let config_path = expand_home(&self.config_path);
         let config = fs::read_to_string(&config_path).map_err(|error| {
             format!(
@@ -178,13 +218,19 @@ impl WakerApp {
             .trim()
             .parse::<MacAddress>()
             .map_err(|error| error.to_string())?;
-        let probe_address = parse_probe_address(&self.probe_address)?;
 
-        Ok(WakeJob {
+        Ok(FritzJob {
             profile,
             fritz_ip,
-            target: WakeTarget::new(mac, probe_address),
+            mac,
         })
+    }
+
+    fn build_job(&self) -> Result<WakeJob, String> {
+        let fritz = self.build_fritz_job()?;
+        let probe_address = parse_probe_address(&self.probe_address)?;
+        let target = WakeTarget::new(fritz.mac, probe_address);
+        Ok(WakeJob { fritz, target })
     }
 
     fn drain_state_updates(&mut self) {
@@ -228,6 +274,24 @@ impl WakerApp {
         }
     }
 
+    fn drain_host_status_update(&mut self) {
+        let Some(receiver) = self.status_check_rx.as_ref() else {
+            return;
+        };
+
+        let update = match receiver.try_recv() {
+            Ok(result) => Some(result),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => Some(Err(
+                "Host status worker stopped without reporting a result".to_owned(),
+            )),
+        };
+
+        if let Some(result) = update {
+            self.host_status = Some(result);
+            self.status_check_rx = None;
+        }
+    }
     fn finish_attempt(&mut self) {
         let Some(active) = self.active_attempt.take() else {
             return;
@@ -314,6 +378,42 @@ impl WakerApp {
                 ui.colored_label(ui.visuals().warn_fg_color, warning);
             }
 
+            ui.separator();
+            ui.label("FRITZ!Box host status");
+            let checking_status = self.status_check_rx.is_some();
+            if ui
+                .add_enabled(
+                    !self.busy && !checking_status,
+                    egui::Button::new("Check PC status"),
+                )
+                .clicked()
+            {
+                self.begin_host_status_check(ctx);
+            }
+            if self.status_check_rx.is_some() {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Checking FRITZ!Box…");
+                });
+            } else if let Some(result) = &self.host_status {
+                match result {
+                    Ok(true) => {
+                        ui.strong("FRITZ!Box reports PC online");
+                    }
+                    Ok(false) => {
+                        ui.label("FRITZ!Box reports PC offline");
+                    }
+                    Err(error) => {
+                        ui.colored_label(
+                            ui.visuals().error_fg_color,
+                            format!("Status check failed: {error}"),
+                        );
+                    }
+                }
+            }
+            ui.small("Queries FRITZ!Box only; does not send Wake-on-LAN.");
+            ui.separator();
+
             ui.horizontal(|ui| {
                 if ui.button("Refresh log").clicked() {
                     self.diagnostics_text = sanitize_diagnostics(&recent_log_tail(
@@ -363,6 +463,14 @@ impl WakerApp {
                 format_duration(summary.elapsed)
             );
         }
+        if let Some(status) = &self.host_status {
+            let status = match status {
+                Ok(true) => "online".to_owned(),
+                Ok(false) => "offline".to_owned(),
+                Err(error) => format!("failed - {error}"),
+            };
+            let _ = write!(output, "FRITZ!Box host status: {status}\n\n");
+        }
         output.push_str(&self.diagnostics_text);
         sanitize_diagnostics(&output)
     }
@@ -371,6 +479,7 @@ impl WakerApp {
 impl eframe::App for WakerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_state_updates();
+        self.drain_host_status_update();
         let ctx = ui.ctx().clone();
 
         egui::CentralPanel::default().show(ui, |ui| {
@@ -380,7 +489,10 @@ impl eframe::App for WakerApp {
                     ui.add_space(8.0);
 
                     let wake_button = egui::Button::new("Wake").min_size(egui::vec2(160.0, 52.0));
-                    if ui.add_enabled(!self.busy, wake_button).clicked() {
+                    if ui
+                        .add_enabled(!self.busy && self.status_check_rx.is_none(), wake_button)
+                        .clicked()
+                    {
                         self.begin_wake(&ctx);
                     }
 
@@ -415,10 +527,23 @@ impl eframe::App for WakerApp {
     }
 }
 
-struct WakeJob {
+struct FritzJob {
     profile: WireGuardProfile,
     fritz_ip: Ipv4Addr,
+    mac: MacAddress,
+}
+
+struct WakeJob {
+    fritz: FritzJob,
     target: WakeTarget,
+}
+
+fn network_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .thread_name("waker-net")
+        .build()
 }
 
 fn spawn_wake_worker(
@@ -430,12 +555,7 @@ fn spawn_wake_worker(
     std::thread::Builder::new()
         .name("waker-worker".to_owned())
         .spawn(move || {
-            let runtime = match tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .worker_threads(2)
-                .thread_name("waker-net")
-                .build()
-            {
+            let runtime = match network_runtime() {
                 Ok(runtime) => runtime,
                 Err(error) => {
                     let failure = WakeFailure::new(
@@ -458,7 +578,8 @@ fn spawn_wake_worker(
             runtime.block_on(
                 async move {
                     let worker_started = Instant::now();
-                    let mut backend = WakerWireGuardBackend::new(job.profile, job.fritz_ip);
+                    let mut backend =
+                        WakerWireGuardBackend::new(job.fritz.profile, job.fritz.fritz_ip);
                     let result = run_wake(&mut backend, &job.target, |state| {
                         log_state(attempt_id, &state);
                         let _ = state_tx.send(state);
@@ -486,6 +607,60 @@ fn spawn_wake_worker(
         .map(|_| ())
 }
 
+fn spawn_host_status_worker(
+    job: FritzJob,
+    result_tx: mpsc::Sender<Result<bool, String>>,
+    repaint: egui::Context,
+) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name("waker-status-worker".to_owned())
+        .spawn(move || {
+            let runtime = match network_runtime() {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let message = format!("could not start networking runtime: {error}");
+                    error!(detail = %message, "host status check failed");
+                    let _ = result_tx.send(Err(message));
+                    repaint.request_repaint();
+                    return;
+                }
+            };
+
+            let span = info_span!("host_status_check");
+            runtime.block_on(
+                async move {
+                    let started = Instant::now();
+                    let mut backend = WakerWireGuardBackend::new(job.profile, job.fritz_ip);
+                    let result = async {
+                        backend.connect().await.map_err(|error| error.to_string())?;
+                        backend
+                            .host_active(job.mac)
+                            .await
+                            .map_err(|error| error.to_string())
+                    }
+                    .await;
+                    backend.disconnect().await;
+
+                    match &result {
+                        Ok(active) => info!(
+                            active,
+                            elapsed_ms = started.elapsed().as_millis(),
+                            "host status check completed"
+                        ),
+                        Err(message) => error!(
+                            detail = %message,
+                            elapsed_ms = started.elapsed().as_millis(),
+                            "host status check failed"
+                        ),
+                    }
+                    let _ = result_tx.send(result);
+                    repaint.request_repaint();
+                }
+                .instrument(span),
+            );
+        })
+        .map(|_| ())
+}
 fn log_state(attempt_id: u64, state: &WakeState) {
     match state {
         WakeState::Idle => info!(attempt_id, stage = "idle", "wake state changed"),
@@ -760,6 +935,18 @@ mod tests {
         assert_eq!(
             app.last_attempt.as_ref().map(|summary| summary.id),
             Some(42)
+        );
+    }
+
+    #[test]
+    fn copied_diagnostics_include_host_status() {
+        let app = WakerApp {
+            host_status: Some(Ok(false)),
+            ..WakerApp::default()
+        };
+        assert!(
+            app.diagnostics_bundle()
+                .contains("FRITZ!Box host status: offline")
         );
     }
 }

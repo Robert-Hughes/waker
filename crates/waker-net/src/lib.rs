@@ -713,17 +713,27 @@ async fn resolve_endpoint(endpoint: &str) -> Result<SocketAddr, NetError> {
         .ok_or_else(|| NetError::Network(format!("endpoint {endpoint} resolved to no addresses")))
 }
 
-#[must_use]
-pub fn fritz_wol_request(fritz_ip: Ipv4Addr, mac: MacAddress) -> Vec<u8> {
+const FRITZ_HOSTS_SERVICE: &str = "urn:dslforum-org:service:Hosts:1";
+
+fn fritz_hosts_request(fritz_ip: Ipv4Addr, action: &str, arguments: &str) -> Vec<u8> {
     let body = format!(
-        "<?xml version=\"1.0\"?><s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\"><s:Body><u:X_AVM-DE_WakeOnLANByMACAddress xmlns:u=\"urn:dslforum-org:service:Hosts:1\"><NewMACAddress>{mac}</NewMACAddress></u:X_AVM-DE_WakeOnLANByMACAddress></s:Body></s:Envelope>"
+        "<?xml version=\"1.0\"?><s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\"><s:Body><u:{action} xmlns:u=\"{FRITZ_HOSTS_SERVICE}\">{arguments}</u:{action}></s:Body></s:Envelope>"
     );
     format!(
-        "POST /upnp/control/hosts HTTP/1.1\r\nHost: {fritz_ip}:49000\r\nContent-Type: text/xml; charset=\"utf-8\"\r\nSOAPAction: \"urn:dslforum-org:service:Hosts:1#X_AVM-DE_WakeOnLANByMACAddress\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "POST /upnp/control/hosts HTTP/1.1\r\nHost: {fritz_ip}:49000\r\nContent-Type: text/xml; charset=\"utf-8\"\r\nSOAPAction: \"{FRITZ_HOSTS_SERVICE}#{action}\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         body.len(),
         body
     )
     .into_bytes()
+}
+
+#[must_use]
+pub fn fritz_wol_request(fritz_ip: Ipv4Addr, mac: MacAddress) -> Vec<u8> {
+    fritz_hosts_request(
+        fritz_ip,
+        "X_AVM-DE_WakeOnLANByMACAddress",
+        &format!("<NewMACAddress>{mac}</NewMACAddress>"),
+    )
 }
 
 fn http_status(response: &[u8]) -> Result<u16, NetError> {
@@ -740,6 +750,34 @@ fn http_status(response: &[u8]) -> Result<u16, NetError> {
         .ok_or_else(|| NetError::Network("HTTP response had no status code".to_owned()))?
         .parse::<u16>()
         .map_err(|error| NetError::Network(format!("invalid HTTP status: {error}")))
+}
+
+fn fritz_host_active(response: &[u8]) -> Result<bool, NetError> {
+    let text = std::str::from_utf8(response)
+        .map_err(|_| NetError::Network("FRITZ!Box host response was not UTF-8".to_owned()))?;
+    let start_tag = "<NewActive>";
+    let end_tag = "</NewActive>";
+    let start = text
+        .find(start_tag)
+        .map(|index| index + start_tag.len())
+        .ok_or_else(|| {
+            NetError::Network("FRITZ!Box host response had no NewActive field".to_owned())
+        })?;
+    let value = text[start..]
+        .split_once(end_tag)
+        .map(|(value, _)| value.trim())
+        .ok_or_else(|| {
+            NetError::Network(
+                "FRITZ!Box host response had an incomplete NewActive field".to_owned(),
+            )
+        })?;
+    match value {
+        "1" | "true" => Ok(true),
+        "0" | "false" => Ok(false),
+        _ => Err(NetError::Network(format!(
+            "FRITZ!Box returned invalid NewActive value {value:?}"
+        ))),
+    }
 }
 
 pub struct WakerWireGuardBackend {
@@ -762,6 +800,43 @@ impl WakerWireGuardBackend {
         self.tunnel
             .as_ref()
             .ok_or_else(|| WakeBackendError::new("WireGuard tunnel is not connected"))
+    }
+
+    async fn hosts_action(
+        &self,
+        action: &str,
+        arguments: &str,
+    ) -> Result<(u16, Vec<u8>), WakeBackendError> {
+        let request = fritz_hosts_request(*self.fritz_address.ip(), action, arguments);
+        let response = self
+            .tunnel()?
+            .http(self.fritz_address, request, Duration::from_secs(8))
+            .await
+            .map_err(to_backend_error)?;
+        let status = http_status(&response).map_err(to_backend_error)?;
+        if !(200..300).contains(&status) {
+            return Err(WakeBackendError::new(format!(
+                "FRITZ!Box Hosts action {action} returned HTTP {status}"
+            )));
+        }
+        Ok((status, response))
+    }
+
+    /// Ask the FRITZ!Box whether the target host is currently active.
+    ///
+    /// The `WireGuard` tunnel must already be connected.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Hosts service request fails or `NewActive` is missing or invalid.
+    pub async fn host_active(&self, mac: MacAddress) -> Result<bool, WakeBackendError> {
+        let arguments = format!("<NewMACAddress>{mac}</NewMACAddress>");
+        let (_status, response) = self
+            .hosts_action("GetSpecificHostEntry", &arguments)
+            .await?;
+        let active = fritz_host_active(&response).map_err(to_backend_error)?;
+        debug!(%mac, active, "FRITZ!Box host status received");
+        Ok(active)
     }
 }
 
@@ -791,18 +866,10 @@ impl WakeBackend for WakerWireGuardBackend {
     }
 
     async fn send_wake(&mut self, mac: MacAddress) -> Result<(), WakeBackendError> {
-        let request = fritz_wol_request(*self.fritz_address.ip(), mac);
-        let response = self
-            .tunnel()?
-            .http(self.fritz_address, request, Duration::from_secs(8))
-            .await
-            .map_err(to_backend_error)?;
-        let status = http_status(&response).map_err(to_backend_error)?;
-        if !(200..300).contains(&status) {
-            return Err(WakeBackendError::new(format!(
-                "FRITZ!Box Wake-on-LAN request returned HTTP {status}"
-            )));
-        }
+        let arguments = format!("<NewMACAddress>{mac}</NewMACAddress>");
+        let (status, _response) = self
+            .hosts_action("X_AVM-DE_WakeOnLANByMACAddress", &arguments)
+            .await?;
         debug!(status, "FRITZ!Box accepted Wake-on-LAN request");
         Ok(())
     }
@@ -874,5 +941,32 @@ PersistentKeepalive = 25
     #[test]
     fn parses_http_status() {
         assert_eq!(http_status(b"HTTP/1.1 200 OK\r\n\r\n").unwrap(), 200);
+    }
+
+    #[test]
+    fn host_status_request_is_targeted_at_hosts_service() {
+        let request = fritz_hosts_request(
+            Ipv4Addr::new(192, 168, 178, 1),
+            "GetSpecificHostEntry",
+            "<NewMACAddress>AA:BB:CC:DD:EE:FF</NewMACAddress>",
+        );
+        let text = String::from_utf8(request).unwrap();
+        assert!(text.starts_with("POST /upnp/control/hosts HTTP/1.1\r\n"));
+        assert!(text.contains("GetSpecificHostEntry"));
+        assert!(text.contains("AA:BB:CC:DD:EE:FF"));
+    }
+
+    #[test]
+    fn parses_fritz_host_active_values() {
+        let active = b"HTTP/1.1 200 OK\r\n\r\n<NewActive>1</NewActive>";
+        let inactive = b"HTTP/1.1 200 OK\r\n\r\n<NewActive>0</NewActive>";
+        assert!(fritz_host_active(active).unwrap());
+        assert!(!fritz_host_active(inactive).unwrap());
+    }
+
+    #[test]
+    fn rejects_missing_fritz_host_active_value() {
+        let response = b"HTTP/1.1 200 OK\r\n\r\n<NewHostName>Example-PC</NewHostName>";
+        assert!(fritz_host_active(response).is_err());
     }
 }

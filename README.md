@@ -113,7 +113,7 @@ cargo-apk2 \
   build -p waker-app --lib --target aarch64-linux-android
 ```
 
-APK compilation, alignment, debug signing and manifest verification have passed. Debug installation, NativeActivity launch, Android logcat output and app-private persistent diagnostics have also been accepted on the Android test device; the remaining on-device acceptance item is a real wake attempt.
+APK compilation, alignment, debug signing and manifest verification have passed. Debug installation, NativeActivity launch, Android diagnostics, real S3 wake, and a mobile-data wake from outside the home LAN have all been accepted on the Android test device. The current wake-completion check still uses the temporary TCP readiness probe while FRITZ!Box host-status polling is evaluated.
 
 On Android, the default WireGuard profile path is `<internalDataPath>/waker.local.conf` (currently `<internalDataPath>/waker.local.conf` on the Android test device). Development profiles should be provisioned there through app-private storage; they should not be copied to shared `/sdcard` storage.
 
@@ -125,7 +125,7 @@ Waker also writes a persistent diagnostic event stream. The default log level is
 
 Desktop logs are written under `$XDG_STATE_HOME/waker/logs`, or `~/.local/state/waker/logs` when `XDG_STATE_HOME` is unset, and are mirrored to stderr. The desktop diagnostics directory is forced to mode `0700`. Android logs are written under the app-private internal data directory and mirrored to Android logcat with tag `Waker`. Logs rotate daily with at most seven files retained.
 
-The in-app **Diagnostics** panel shows the last attempt, persistent-log status, and a recent log tail. **Copy diagnostics** copies a sanitised bundle suitable for troubleshooting. WireGuard private keys and preshared keys are private implementation fields, never deliberately logged, and credential-assignment lines are redacted again when diagnostics are copied.
+The in-app **Diagnostics** panel shows the last attempt, persistent-log status, a recent log tail, and a **Check PC status** action. That action reuses Waker's normal private WireGuard and FRITZ!Box Hosts-service path to call `GetSpecificHostEntry` for the configured target MAC, reports `NewActive`, and never sends Wake-on-LAN. **Copy diagnostics** includes the last host-status result and copies a sanitised bundle suitable for troubleshooting. WireGuard private keys and preshared keys are private implementation fields, never deliberately logged, and credential-assignment lines are redacted again when diagnostics are copied.
 
 ## Validation
 
