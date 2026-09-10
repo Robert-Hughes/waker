@@ -111,7 +111,9 @@ cargo-apk2 \
   build -p waker-app --lib --target aarch64-linux-android
 ```
 
-APK compilation, alignment, debug signing and manifest verification have passed. Physical install/launch and Android runtime diagnostics remain to be accepted on the Android test device when the phone is available.
+APK compilation, alignment, debug signing and manifest verification have passed. Debug installation, NativeActivity launch, Android logcat output and app-private persistent diagnostics have also been accepted on the Android test device; the remaining on-device acceptance item is a real wake attempt.
+
+On Android, the default WireGuard profile path is `<internalDataPath>/waker.local.conf` (currently `<internalDataPath>/waker.local.conf` on the Android test device). Development profiles should be provisioned there through app-private storage; they should not be copied to shared `/sdcard` storage.
 
 ## Diagnostics and reporting
 

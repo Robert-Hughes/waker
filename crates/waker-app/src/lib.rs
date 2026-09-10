@@ -53,15 +53,20 @@ pub struct WakerApp {
 
 impl Default for WakerApp {
     fn default() -> Self {
-        Self::new(DiagnosticsInfo::default())
+        Self::new(DiagnosticsInfo::default(), None)
     }
 }
 
 impl WakerApp {
-    fn new(diagnostics: DiagnosticsInfo) -> Self {
+    fn new(diagnostics: DiagnosticsInfo, default_config_path: Option<PathBuf>) -> Self {
+        let config_path = std::env::var("WAKER_WG_CONFIG").unwrap_or_else(|_| {
+            default_config_path
+                .unwrap_or_else(|| PathBuf::from("waker.local.conf"))
+                .to_string_lossy()
+                .into_owned()
+        });
         Self {
-            config_path: std::env::var("WAKER_WG_CONFIG")
-                .unwrap_or_else(|_| "waker.local.conf".to_owned()),
+            config_path,
             fritz_ip: std::env::var("WAKER_FRITZ_IP")
                 .unwrap_or_else(|_| "192.168.178.1".to_owned()),
             pc_mac: std::env::var("WAKER_PC_MAC").unwrap_or_default(),
@@ -583,7 +588,9 @@ pub fn run_desktop(diagnostics_runtime: DiagnosticsRuntime) -> eframe::Result {
     let result = eframe::run_native(
         APP_NAME,
         options,
-        Box::new(move |_creation_context| Ok(Box::new(WakerApp::new(diagnostics_info.clone())))),
+        Box::new(move |_creation_context| {
+            Ok(Box::new(WakerApp::new(diagnostics_info.clone(), None)))
+        }),
     );
     if let Err(error) = &result {
         error!(%error, "desktop event loop failed");
@@ -596,7 +603,11 @@ pub fn run_desktop(diagnostics_runtime: DiagnosticsRuntime) -> eframe::Result {
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub fn android_main(app: winit::platform::android::activity::AndroidApp) {
-    let diagnostics_runtime = diagnostics::init_android(app.internal_data_path());
+    let internal_data_path = app.internal_data_path();
+    let default_config_path = internal_data_path
+        .as_ref()
+        .map(|path| path.join("waker.local.conf"));
+    let diagnostics_runtime = diagnostics::init_android(internal_data_path);
     let diagnostics_info = diagnostics_runtime.info().clone();
     info!(
         persistent_logging = diagnostics_runtime.is_persistent(),
@@ -613,7 +624,12 @@ pub fn android_main(app: winit::platform::android::activity::AndroidApp) {
     let result = eframe::run_native(
         APP_NAME,
         options,
-        Box::new(move |_creation_context| Ok(Box::new(WakerApp::new(diagnostics_info.clone())))),
+        Box::new(move |_creation_context| {
+            Ok(Box::new(WakerApp::new(
+                diagnostics_info.clone(),
+                default_config_path.clone(),
+            )))
+        }),
     );
     if let Err(error) = result {
         error!(%error, "Android event loop failed");
