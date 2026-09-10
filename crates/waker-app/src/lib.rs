@@ -37,6 +37,13 @@ struct AttemptSummary {
     failure: Option<WakeFailure>,
 }
 
+#[derive(Default)]
+struct WakerFileSettings {
+    fritz_ip: Option<String>,
+    pc_mac: Option<String>,
+    probe_address: Option<String>,
+}
+
 pub struct WakerApp {
     config_path: String,
     fritz_ip: String,
@@ -65,12 +72,25 @@ impl WakerApp {
                 .to_string_lossy()
                 .into_owned()
         });
+        let WakerFileSettings {
+            fritz_ip,
+            pc_mac,
+            probe_address,
+        } = load_waker_file_settings(&config_path);
         Self {
             config_path,
             fritz_ip: std::env::var("WAKER_FRITZ_IP")
-                .unwrap_or_else(|_| "192.168.178.1".to_owned()),
-            pc_mac: std::env::var("WAKER_PC_MAC").unwrap_or_default(),
-            probe_address: std::env::var("WAKER_PC_PROBE").unwrap_or_default(),
+                .ok()
+                .or(fritz_ip)
+                .unwrap_or_else(|| "192.168.178.1".to_owned()),
+            pc_mac: std::env::var("WAKER_PC_MAC")
+                .ok()
+                .or(pc_mac)
+                .unwrap_or_default(),
+            probe_address: std::env::var("WAKER_PC_PROBE")
+                .ok()
+                .or(probe_address)
+                .unwrap_or_default(),
             state: WakeState::Idle,
             state_rx: None,
             busy: false,
@@ -539,6 +559,32 @@ fn sanitize_diagnostics(input: &str) -> String {
         .join("\n")
 }
 
+fn load_waker_file_settings(config_path: &str) -> WakerFileSettings {
+    let path = expand_home(config_path);
+    let Ok(config) = fs::read_to_string(path) else {
+        return WakerFileSettings::default();
+    };
+    parse_waker_file_settings(&config)
+}
+
+fn parse_waker_file_settings(config: &str) -> WakerFileSettings {
+    let mut settings = WakerFileSettings::default();
+    for raw_line in config.lines() {
+        let line = raw_line.split('#').next().unwrap_or_default().trim();
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim();
+        match key.trim().to_ascii_lowercase().as_str() {
+            "wakerfritzip" => settings.fritz_ip = Some(value.to_owned()),
+            "wakerpcmac" => settings.pc_mac = Some(value.to_owned()),
+            "wakerprobeaddress" => settings.probe_address = Some(value.to_owned()),
+            _ => {}
+        }
+    }
+    settings
+}
+
 fn parse_probe_address(value: &str) -> Result<SocketAddrV4, String> {
     let value = value.trim();
     SocketAddrV4::from_str(value)
@@ -651,6 +697,21 @@ mod tests {
     fn parses_ipv4_probe_address() {
         let address = parse_probe_address("192.0.2.42:22").unwrap();
         assert_eq!(address.port(), 22);
+    }
+
+    #[test]
+    fn parses_waker_fields_from_combined_profile() {
+        let settings = parse_waker_file_settings(
+            "[Interface]\nAddress = 192.0.2.2/24\nWakerFritzIP = 192.168.178.1\n\
+             WakerPcMac = AA:BB:CC:DD:EE:FF\nWakerProbeAddress = 192.0.2.42:22\n\
+             [Peer]\nEndpoint = example.invalid:51820\n",
+        );
+        assert_eq!(settings.fritz_ip.as_deref(), Some("192.168.178.1"));
+        assert_eq!(settings.pc_mac.as_deref(), Some("AA:BB:CC:DD:EE:FF"));
+        assert_eq!(
+            settings.probe_address.as_deref(),
+            Some("192.0.2.42:22")
+        );
     }
 
     #[test]

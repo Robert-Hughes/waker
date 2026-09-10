@@ -68,13 +68,15 @@ cargo run -p waker-app --bin waker
 
 The probe should be a TCP port that becomes available reliably after the PC boots, for example SSH, RDP, or another known service. It is a stronger readiness check than merely receiving ICMP.
 
-`waker.local.conf` is ignored by Git and is the default desktop profile path, so a convenient development setup is:
+`waker.local.conf` is ignored by Git and is the default desktop profile path. Waker can keep its application settings in the same private file using the extension keys `WakerFritzIP`, `WakerPcMac`, and `WakerProbeAddress`:
 
-```sh
-cp /path/to/exported-fritz-wireguard.conf ./waker.local.conf
+```ini
+WakerFritzIP = 192.168.178.1
+WakerPcMac = AA:BB:CC:DD:EE:FF
+WakerProbeAddress = 192.0.2.42:22
 ```
 
-Waker parses only the WireGuard fields it needs. `DNS` and other wg-quick-only fields are ignored because Waker never changes system DNS or routes.
+Environment variables override these file values, and file values override built-in defaults. The WireGuard parser deliberately ignores the Waker extension keys as well as wg-quick-only fields such as `DNS`; Waker never changes system DNS or routes.
 
 ## Local WireGuard lab
 
