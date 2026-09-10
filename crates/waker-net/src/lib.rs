@@ -19,9 +19,9 @@ use ipnetwork::{IpNetwork, Ipv4Network};
 use smoltcp::{
     iface::{Config as InterfaceConfig, Interface, SocketSet},
     phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken},
-    socket::tcp,
+    socket::{icmp, tcp},
     time::Instant as SmolInstant,
-    wire::{HardwareAddress, IpAddress, IpCidr, Ipv4Address},
+    wire::{HardwareAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr, Ipv4Address},
 };
 use thiserror::Error;
 use tokio::{
@@ -379,6 +379,11 @@ enum NetCommand {
         timeout: Duration,
         response: oneshot::Sender<Result<bool, NetError>>,
     },
+    Ping {
+        target: Ipv4Addr,
+        timeout: Duration,
+        response: oneshot::Sender<Result<bool, NetError>>,
+    },
 }
 
 struct SmolEngine {
@@ -438,6 +443,14 @@ impl SmolEngine {
                     response,
                 } => {
                     let result = self.probe(target, timeout).await;
+                    let _ = response.send(result);
+                }
+                NetCommand::Ping {
+                    target,
+                    timeout,
+                    response,
+                } => {
+                    let result = self.ping(target, timeout).await;
                     let _ = response.send(result);
                 }
             }
@@ -541,6 +554,71 @@ impl SmolEngine {
                 return Ok(false);
             }
 
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    async fn ping(&mut self, target: Ipv4Addr, timeout: Duration) -> Result<bool, NetError> {
+        const ICMP_IDENT: u16 = 0x574b;
+        const ICMP_SEQUENCE: u16 = 1;
+        const ICMP_PAYLOAD: &[u8] = b"waker";
+
+        let rx = icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY], vec![0_u8; 64]);
+        let tx = icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY], vec![0_u8; 64]);
+        let mut socket = icmp::Socket::new(rx, tx);
+        socket
+            .bind(icmp::Endpoint::Ident(ICMP_IDENT))
+            .map_err(|error| NetError::Network(format!("ICMP bind failed: {error}")))?;
+
+        let checksum = self.device.capabilities().checksum;
+        let repr = Icmpv4Repr::EchoRequest {
+            ident: ICMP_IDENT,
+            seq_no: ICMP_SEQUENCE,
+            data: ICMP_PAYLOAD,
+        };
+        let mut bytes = vec![0_u8; repr.buffer_len()];
+        let mut packet = Icmpv4Packet::new_unchecked(&mut bytes);
+        repr.emit(&mut packet, &checksum);
+
+        socket
+            .send_slice(&bytes, IpAddress::Ipv4(to_smol_ipv4(target)))
+            .map_err(|error| NetError::Network(format!("ICMP send failed: {error}")))?;
+        let handle = self.sockets.add(socket);
+        let deadline = tokio::time::Instant::now() + timeout;
+
+        loop {
+            self.iface
+                .poll(SmolInstant::now(), &mut self.device, &mut self.sockets);
+
+            let socket = self.sockets.get_mut::<icmp::Socket>(handle);
+            while socket.can_recv() {
+                let (bytes, source) = socket
+                    .recv()
+                    .map_err(|error| NetError::Network(format!("ICMP receive failed: {error}")))?;
+                let Ok(packet) = Icmpv4Packet::new_checked(bytes) else {
+                    continue;
+                };
+                let Ok(Icmpv4Repr::EchoReply {
+                    ident,
+                    seq_no,
+                    data: _,
+                }) = Icmpv4Repr::parse(&packet, &checksum)
+                else {
+                    continue;
+                };
+                if source == IpAddress::Ipv4(to_smol_ipv4(target))
+                    && ident == ICMP_IDENT
+                    && seq_no == ICMP_SEQUENCE
+                {
+                    self.sockets.remove(handle);
+                    return Ok(true);
+                }
+            }
+
+            if tokio::time::Instant::now() >= deadline {
+                self.sockets.remove(handle);
+                return Ok(false);
+            }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
@@ -672,6 +750,24 @@ impl TunnelClient {
         rx.await.map_err(|_| NetError::WorkerStopped)?
     }
 
+    /// Send one ICMP echo request through the private WireGuard/smoltcp stack.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the tunnel worker has stopped or the private stack cannot perform the ping.
+    pub async fn ping(&self, target: Ipv4Addr, timeout: Duration) -> Result<bool, NetError> {
+        let (tx, rx) = oneshot::channel();
+        self.commands
+            .send(NetCommand::Ping {
+                target,
+                timeout,
+                response: tx,
+            })
+            .await
+            .map_err(|_| NetError::WorkerStopped)?;
+        rx.await.map_err(|_| NetError::WorkerStopped)?
+    }
+
     /// Attempt a TCP connection through the private WireGuard/smoltcp stack.
     ///
     /// # Errors
@@ -752,6 +848,32 @@ fn http_status(response: &[u8]) -> Result<u16, NetError> {
         .map_err(|error| NetError::Network(format!("invalid HTTP status: {error}")))
 }
 
+fn fritz_host_ip(response: &[u8]) -> Result<Ipv4Addr, NetError> {
+    let text = std::str::from_utf8(response)
+        .map_err(|_| NetError::Network("FRITZ!Box host response was not UTF-8".to_owned()))?;
+    let start_tag = "<NewIPAddress>";
+    let end_tag = "</NewIPAddress>";
+    let start = text
+        .find(start_tag)
+        .map(|index| index + start_tag.len())
+        .ok_or_else(|| {
+            NetError::Network("FRITZ!Box host response had no NewIPAddress field".to_owned())
+        })?;
+    let value = text[start..]
+        .split_once(end_tag)
+        .map(|(value, _)| value.trim())
+        .ok_or_else(|| {
+            NetError::Network(
+                "FRITZ!Box host response had an incomplete NewIPAddress field".to_owned(),
+            )
+        })?;
+    value.parse::<Ipv4Addr>().map_err(|error| {
+        NetError::Network(format!(
+            "FRITZ!Box returned invalid NewIPAddress value {value:?}: {error}"
+        ))
+    })
+}
+
 fn fritz_host_active(response: &[u8]) -> Result<bool, NetError> {
     let text = std::str::from_utf8(response)
         .map_err(|_| NetError::Network("FRITZ!Box host response was not UTF-8".to_owned()))?;
@@ -830,13 +952,38 @@ impl WakerWireGuardBackend {
     ///
     /// Returns an error if the Hosts service request fails or `NewActive` is missing or invalid.
     pub async fn host_active(&self, mac: MacAddress) -> Result<bool, WakeBackendError> {
+        let response = self.host_entry(mac).await?;
+        let active = fritz_host_active(&response).map_err(to_backend_error)?;
+        debug!(%mac, active, "FRITZ!Box host status received");
+        Ok(active)
+    }
+
+    async fn host_entry(&self, mac: MacAddress) -> Result<Vec<u8>, WakeBackendError> {
         let arguments = format!("<NewMACAddress>{mac}</NewMACAddress>");
         let (_status, response) = self
             .hosts_action("GetSpecificHostEntry", &arguments)
             .await?;
-        let active = fritz_host_active(&response).map_err(to_backend_error)?;
-        debug!(%mac, active, "FRITZ!Box host status received");
-        Ok(active)
+        Ok(response)
+    }
+
+    /// Resolve the target host through the FRITZ!Box Hosts service, then send one ICMP echo.
+    ///
+    /// The `WireGuard` tunnel must already be connected.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if host lookup fails, the FRITZ!Box does not return a usable IPv4
+    /// address, or the private userspace stack cannot perform the ping.
+    pub async fn ping_host(&self, mac: MacAddress) -> Result<bool, WakeBackendError> {
+        let response = self.host_entry(mac).await?;
+        let target = fritz_host_ip(&response).map_err(to_backend_error)?;
+        let reachable = self
+            .tunnel()?
+            .ping(target, Duration::from_secs(2))
+            .await
+            .map_err(to_backend_error)?;
+        debug!(reachable, "PC ICMP ping completed");
+        Ok(reachable)
     }
 }
 
@@ -968,5 +1115,20 @@ PersistentKeepalive = 25
     fn rejects_missing_fritz_host_active_value() {
         let response = b"HTTP/1.1 200 OK\r\n\r\n<NewHostName>Example-PC</NewHostName>";
         assert!(fritz_host_active(response).is_err());
+    }
+
+    #[test]
+    fn parses_fritz_host_ipv4_address() {
+        let response = b"HTTP/1.1 200 OK\r\n\r\n<NewIPAddress>192.0.2.42</NewIPAddress>";
+        assert_eq!(
+            fritz_host_ip(response).unwrap(),
+            Ipv4Addr::new(192, 0, 2, 42)
+        );
+    }
+
+    #[test]
+    fn rejects_missing_fritz_host_ipv4_address() {
+        let response = b"HTTP/1.1 200 OK\r\n\r\n<NewActive>1</NewActive>";
+        assert!(fritz_host_ip(response).is_err());
     }
 }

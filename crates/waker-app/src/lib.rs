@@ -58,6 +58,8 @@ pub struct WakerApp {
     last_attempt: Option<AttemptSummary>,
     status_check_rx: Option<Receiver<Result<bool, String>>>,
     host_status: Option<Result<bool, String>>,
+    ping_check_rx: Option<Receiver<Result<bool, String>>>,
+    ping_status: Option<Result<bool, String>>,
     diagnostics: DiagnosticsInfo,
     diagnostics_text: String,
 }
@@ -102,6 +104,8 @@ impl WakerApp {
             last_attempt: None,
             status_check_rx: None,
             host_status: None,
+            ping_check_rx: None,
+            ping_status: None,
             diagnostics,
             diagnostics_text: String::new(),
         }
@@ -166,7 +170,7 @@ impl WakerApp {
     }
 
     fn begin_host_status_check(&mut self, ctx: &egui::Context) {
-        if self.busy || self.status_check_rx.is_some() {
+        if self.busy || self.status_check_rx.is_some() || self.ping_check_rx.is_some() {
             return;
         }
         info!("FRITZ!Box host status check requested");
@@ -195,6 +199,31 @@ impl WakerApp {
             Err(message) => {
                 error!(detail = %message, "host status check rejected");
                 self.host_status = Some(Err(message));
+            }
+        }
+    }
+
+    fn begin_ping_check(&mut self, ctx: &egui::Context) {
+        if self.busy || self.status_check_rx.is_some() || self.ping_check_rx.is_some() {
+            return;
+        }
+        info!("PC ICMP ping requested");
+
+        match self.build_fritz_job() {
+            Ok(job) => {
+                let (result_tx, result_rx) = mpsc::channel();
+                self.ping_check_rx = Some(result_rx);
+                self.ping_status = None;
+                if let Err(error) = spawn_ping_worker(job, result_tx, ctx.clone()) {
+                    error!(%error, "PC ICMP ping failed before worker start");
+                    self.ping_check_rx = None;
+                    self.ping_status =
+                        Some(Err(format!("Could not create worker thread: {error}")));
+                }
+            }
+            Err(message) => {
+                error!(detail = %message, "PC ICMP ping rejected");
+                self.ping_status = Some(Err(message));
             }
         }
     }
@@ -292,6 +321,25 @@ impl WakerApp {
             self.status_check_rx = None;
         }
     }
+    fn drain_ping_update(&mut self) {
+        let Some(receiver) = self.ping_check_rx.as_ref() else {
+            return;
+        };
+
+        let update = match receiver.try_recv() {
+            Ok(result) => Some(result),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => Some(Err(
+                "Ping worker stopped without reporting a result".to_owned(),
+            )),
+        };
+
+        if let Some(result) = update {
+            self.ping_status = Some(result);
+            self.ping_check_rx = None;
+        }
+    }
+
     fn finish_attempt(&mut self) {
         let Some(active) = self.active_attempt.take() else {
             return;
@@ -379,39 +427,9 @@ impl WakerApp {
             }
 
             ui.separator();
-            ui.label("FRITZ!Box host status");
-            let checking_status = self.status_check_rx.is_some();
-            if ui
-                .add_enabled(
-                    !self.busy && !checking_status,
-                    egui::Button::new("Check PC status"),
-                )
-                .clicked()
-            {
-                self.begin_host_status_check(ctx);
-            }
-            if self.status_check_rx.is_some() {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label("Checking FRITZ!Box…");
-                });
-            } else if let Some(result) = &self.host_status {
-                match result {
-                    Ok(true) => {
-                        ui.strong("FRITZ!Box reports PC online");
-                    }
-                    Ok(false) => {
-                        ui.label("FRITZ!Box reports PC offline");
-                    }
-                    Err(error) => {
-                        ui.colored_label(
-                            ui.visuals().error_fg_color,
-                            format!("Status check failed: {error}"),
-                        );
-                    }
-                }
-            }
-            ui.small("Queries FRITZ!Box only; does not send Wake-on-LAN.");
+            self.render_fritz_status_diagnostic(ui, ctx);
+            ui.separator();
+            self.render_ping_diagnostic(ui, ctx);
             ui.separator();
 
             ui.horizontal(|ui| {
@@ -445,6 +463,77 @@ impl WakerApp {
         });
     }
 
+    fn render_fritz_status_diagnostic(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.label("FRITZ!Box host status");
+        let checking_status = self.status_check_rx.is_some();
+        if ui
+            .add_enabled(
+                !self.busy && !checking_status && self.ping_check_rx.is_none(),
+                egui::Button::new("Check PC via FRITZ!Box API"),
+            )
+            .clicked()
+        {
+            self.begin_host_status_check(ctx);
+        }
+        if checking_status {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Checking FRITZ!Box…");
+            });
+        } else if let Some(result) = &self.host_status {
+            match result {
+                Ok(true) => {
+                    ui.strong("FRITZ!Box reports PC online");
+                }
+                Ok(false) => {
+                    ui.label("FRITZ!Box reports PC offline");
+                }
+                Err(error) => {
+                    ui.colored_label(
+                        ui.visuals().error_fg_color,
+                        format!("Status check failed: {error}"),
+                    );
+                }
+            }
+        }
+        ui.small("Queries FRITZ!Box only; does not send Wake-on-LAN.");
+    }
+
+    fn render_ping_diagnostic(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.label("PC ICMP reachability");
+        let checking_ping = self.ping_check_rx.is_some();
+        if ui
+            .add_enabled(
+                !self.busy && self.status_check_rx.is_none() && !checking_ping,
+                egui::Button::new("Ping PC through tunnel"),
+            )
+            .clicked()
+        {
+            self.begin_ping_check(ctx);
+        }
+        if checking_ping {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Resolving PC and pinging…");
+            });
+        } else if let Some(result) = &self.ping_status {
+            match result {
+                Ok(true) => {
+                    ui.strong("PC replied to ICMP ping");
+                }
+                Ok(false) => {
+                    ui.label("No ICMP reply from PC");
+                }
+                Err(error) => {
+                    ui.colored_label(ui.visuals().error_fg_color, format!("Ping failed: {error}"));
+                }
+            }
+        }
+        ui.small(
+            "Uses the FRITZ!Box API to resolve the PC from its MAC, then sends ICMP through Waker's private tunnel; does not send Wake-on-LAN.",
+        );
+    }
+
     fn diagnostics_bundle(&self) -> String {
         let mut output = String::from("Waker diagnostics\n");
         if let Some(summary) = &self.last_attempt {
@@ -471,6 +560,14 @@ impl WakerApp {
             };
             let _ = write!(output, "FRITZ!Box host status: {status}\n\n");
         }
+        if let Some(status) = &self.ping_status {
+            let status = match status {
+                Ok(true) => "reply received".to_owned(),
+                Ok(false) => "no reply".to_owned(),
+                Err(error) => format!("failed - {error}"),
+            };
+            let _ = write!(output, "PC ICMP ping: {status}\n\n");
+        }
         output.push_str(&self.diagnostics_text);
         sanitize_diagnostics(&output)
     }
@@ -480,6 +577,7 @@ impl eframe::App for WakerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_state_updates();
         self.drain_host_status_update();
+        self.drain_ping_update();
         let ctx = ui.ctx().clone();
 
         egui::CentralPanel::default().show(ui, |ui| {
@@ -490,7 +588,12 @@ impl eframe::App for WakerApp {
 
                     let wake_button = egui::Button::new("Wake").min_size(egui::vec2(160.0, 52.0));
                     if ui
-                        .add_enabled(!self.busy && self.status_check_rx.is_none(), wake_button)
+                        .add_enabled(
+                            !self.busy
+                                && self.status_check_rx.is_none()
+                                && self.ping_check_rx.is_none(),
+                            wake_button,
+                        )
                         .clicked()
                     {
                         self.begin_wake(&ctx);
@@ -661,6 +764,61 @@ fn spawn_host_status_worker(
         })
         .map(|_| ())
 }
+fn spawn_ping_worker(
+    job: FritzJob,
+    result_tx: mpsc::Sender<Result<bool, String>>,
+    repaint: egui::Context,
+) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name("waker-ping-worker".to_owned())
+        .spawn(move || {
+            let runtime = match network_runtime() {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let message = format!("could not start networking runtime: {error}");
+                    error!(detail = %message, "PC ICMP ping failed");
+                    let _ = result_tx.send(Err(message));
+                    repaint.request_repaint();
+                    return;
+                }
+            };
+
+            let span = info_span!("pc_icmp_ping");
+            runtime.block_on(
+                async move {
+                    let started = Instant::now();
+                    let mut backend = WakerWireGuardBackend::new(job.profile, job.fritz_ip);
+                    let result = async {
+                        backend.connect().await.map_err(|error| error.to_string())?;
+                        backend
+                            .ping_host(job.mac)
+                            .await
+                            .map_err(|error| error.to_string())
+                    }
+                    .await;
+                    backend.disconnect().await;
+
+                    match &result {
+                        Ok(reachable) => info!(
+                            reachable,
+                            elapsed_ms = started.elapsed().as_millis(),
+                            "PC ICMP ping completed"
+                        ),
+                        Err(message) => error!(
+                            detail = %message,
+                            elapsed_ms = started.elapsed().as_millis(),
+                            "PC ICMP ping failed"
+                        ),
+                    }
+                    let _ = result_tx.send(result);
+                    repaint.request_repaint();
+                }
+                .instrument(span),
+            );
+        })
+        .map(|_| ())
+}
+
 fn log_state(attempt_id: u64, state: &WakeState) {
     match state {
         WakeState::Idle => info!(attempt_id, stage = "idle", "wake state changed"),
@@ -944,6 +1102,18 @@ mod tests {
         assert!(
             app.diagnostics_bundle()
                 .contains("FRITZ!Box host status: offline")
+        );
+    }
+
+    #[test]
+    fn copied_diagnostics_include_icmp_ping_status() {
+        let app = WakerApp {
+            ping_status: Some(Ok(true)),
+            ..WakerApp::default()
+        };
+        assert!(
+            app.diagnostics_bundle()
+                .contains("PC ICMP ping: reply received")
         );
     }
 }
