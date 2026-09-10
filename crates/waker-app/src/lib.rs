@@ -883,10 +883,7 @@ mod tests {
         );
         assert_eq!(settings.fritz_ip.as_deref(), Some("192.168.178.1"));
         assert_eq!(settings.pc_mac.as_deref(), Some("AA:BB:CC:DD:EE:FF"));
-        assert_eq!(
-            settings.probe_address.as_deref(),
-            Some("192.0.2.42:22")
-        );
+        assert_eq!(settings.probe_address.as_deref(), Some("192.0.2.42:22"));
     }
 
     #[test]

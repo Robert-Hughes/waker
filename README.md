@@ -106,16 +106,11 @@ cargo run -p waker-lab
 
 The Android application is pure Rust. `waker-app` builds as a `cdylib`, uses winit's `NativeActivity` backend through eframe, and requests only normal internet access. It does **not** request Android VPN permission.
 
-The Cargo manifest uses display name **Waker** and package name `app.waker.android`. On Example-PC, the tested native-FreeBSD Android workflow is documented in `host-specific Android build notes`; a debug APK can be built with:
+The Cargo manifest uses display name **Waker** and package name `app.waker.android`. Android packaging requires a Rust Android toolchain and an APK packager compatible with the manifest metadata in `crates/waker-app/Cargo.toml`; host-specific SDK/NDK setup is intentionally kept outside this repository.
 
-```sh
-cargo-apk2 \
-  build -p waker-app --lib --target aarch64-linux-android
-```
+Android debug builds, NativeActivity launch, diagnostics, S3 wake, and a mobile-data wake from outside the home LAN have all been exercised during development. The current wake-completion check still uses the temporary TCP readiness probe while FRITZ!Box host-status polling is evaluated.
 
-APK compilation, alignment, debug signing and manifest verification have passed. Debug installation, NativeActivity launch, Android diagnostics, real S3 wake, and a mobile-data wake from outside the home LAN have all been accepted on the Android test device. The current wake-completion check still uses the temporary TCP readiness probe while FRITZ!Box host-status polling is evaluated.
-
-On Android, the default WireGuard profile path is `<internalDataPath>/waker.local.conf` (currently `<internalDataPath>/waker.local.conf` on the Android test device). Development profiles should be provisioned there through app-private storage; they should not be copied to shared `/sdcard` storage.
+On Android, the default WireGuard profile path is `<internalDataPath>/waker.local.conf`. Development profiles should be provisioned there through app-private storage; they should not be copied to shared `/sdcard` storage.
 
 ## Diagnostics and reporting
 
@@ -149,3 +144,7 @@ WAKER_LOG=trace cargo run -p waker-app --bin waker
 Waker's inner network exists only in process memory. The host operating system sees an ordinary UDP flow to the WireGuard endpoint. It does not receive an inner route to the home LAN, and other applications cannot accidentally use Waker's tunnel.
 
 Real WireGuard configuration files contain private keys and must not be committed. The repository ignores `waker.local.conf` and `config.local.toml`; additional local profiles should be kept outside the repository or added to local ignore rules.
+
+## Licence
+
+Waker is available under either the Apache License 2.0 or the MIT licence, at your option. See `LICENSE-APACHE` and `LICENSE-MIT`.
