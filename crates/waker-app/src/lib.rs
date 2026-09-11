@@ -70,9 +70,9 @@ pub struct WakerApp {
     ping_status: Option<Result<bool, String>>,
     ping_status_deadline: Option<Instant>,
     diagnostics: DiagnosticsInfo,
-    diagnostics_text: String,
     branding: Option<BrandingTextures>,
     clipboard_status: Option<Result<(), String>>,
+    open_log_status: Option<Result<(), String>>,
     #[cfg(target_os = "android")]
     android_app: Option<winit::platform::android::activity::AndroidApp>,
     #[cfg(target_os = "android")]
@@ -117,9 +117,9 @@ impl WakerApp {
             ping_status: None,
             ping_status_deadline: None,
             diagnostics,
-            diagnostics_text: String::new(),
             branding: None,
             clipboard_status: None,
+            open_log_status: None,
             #[cfg(target_os = "android")]
             android_app: None,
             #[cfg(target_os = "android")]
@@ -591,45 +591,31 @@ impl WakerApp {
                 ui.separator();
 
                 ui.horizontal(|ui| {
-                    if ui.button("Refresh log").clicked() {
-                        self.diagnostics_text = sanitize_diagnostics(&recent_log_tail(
-                            &self.diagnostics,
-                            DIAGNOSTIC_TAIL_BYTES,
-                        ));
+                    if ui.button("Open log").clicked() {
+                        self.open_log(ctx);
                     }
-                    if ui.button("Copy diagnostics").clicked() {
-                        self.diagnostics_text = sanitize_diagnostics(&recent_log_tail(
-                            &self.diagnostics,
-                            DIAGNOSTIC_TAIL_BYTES,
-                        ));
+                    if ui.button("Copy log").clicked() {
                         self.copy_diagnostics_to_clipboard(ctx);
                     }
                 });
+                if let Some(Err(error)) = &self.open_log_status {
+                    ui.colored_label(
+                        ui.visuals().error_fg_color,
+                        format!("Could not open log: {error}"),
+                    );
+                }
                 if let Some(status) = &self.clipboard_status {
                     match status {
                         Ok(()) => {
-                            ui.small("Diagnostics copied to clipboard");
+                            ui.small("Log copied to clipboard");
                         }
                         Err(error) => {
                             ui.colored_label(
                                 ui.visuals().error_fg_color,
-                                format!("Could not copy diagnostics: {error}"),
+                                format!("Could not copy log: {error}"),
                             );
                         }
                     }
-                }
-
-                if !self.diagnostics_text.is_empty() {
-                    egui::ScrollArea::vertical()
-                        .max_height(180.0)
-                        .show(ui, |ui| {
-                            ui.add(
-                                egui::TextEdit::multiline(&mut self.diagnostics_text)
-                                    .font(egui::TextStyle::Monospace)
-                                    .desired_width(f32::INFINITY)
-                                    .interactive(false),
-                            );
-                        });
                 }
             });
         });
@@ -678,10 +664,40 @@ impl WakerApp {
         );
     }
 
+    fn current_log_text(&self) -> String {
+        sanitize_diagnostics(&recent_log_tail(&self.diagnostics, DIAGNOSTIC_TAIL_BYTES))
+    }
+
+    fn open_log(&mut self, ctx: &egui::Context) {
+        #[cfg(target_os = "android")]
+        let _ = ctx;
+        self.clipboard_status = None;
+        let text = self.current_log_text();
+        let uri = text_data_uri(&text);
+
+        #[cfg(target_os = "android")]
+        let result = self
+            .android_app
+            .as_ref()
+            .ok_or_else(|| "Android activity is unavailable".to_owned())
+            .and_then(|app| android_open_text_uri(app, &uri));
+
+        #[cfg(not(target_os = "android"))]
+        let result = {
+            ctx.open_url(egui::OpenUrl::same_tab(uri));
+            Ok(())
+        };
+
+        self.open_log_status = Some(result);
+    }
+
     fn copy_diagnostics_to_clipboard(&mut self, ctx: &egui::Context) {
         #[cfg(target_os = "android")]
         let _ = ctx;
-        let text = self.diagnostics_bundle();
+        self.open_log_status = None;
+        let log_text = self.current_log_text();
+        let text = self.diagnostics_bundle(&log_text);
+
         #[cfg(target_os = "android")]
         let result = self
             .android_app
@@ -698,7 +714,7 @@ impl WakerApp {
         self.clipboard_status = Some(result);
     }
 
-    fn diagnostics_bundle(&self) -> String {
+    fn diagnostics_bundle(&self, log_text: &str) -> String {
         let mut output = String::from("Waker diagnostics\n");
         if let Some(summary) = &self.last_attempt {
             let outcome = match &summary.failure {
@@ -731,7 +747,7 @@ impl WakerApp {
             };
             let _ = write!(output, "PC ICMP ping: {status}\n\n");
         }
-        output.push_str(&self.diagnostics_text);
+        output.push_str(log_text);
         sanitize_diagnostics(&output)
     }
 }
@@ -747,6 +763,22 @@ fn friendly_failure_message(failure: &WakeFailure) -> &'static str {
     } else {
         failure.user_message()
     }
+}
+
+fn text_data_uri(text: &str) -> String {
+    let mut uri = String::with_capacity("data:text/plain;charset=utf-8,".len() + text.len() * 3);
+    uri.push_str("data:text/plain;charset=utf-8,");
+    for byte in text.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                uri.push(char::from(byte));
+            }
+            _ => {
+                let _ = write!(uri, "%{byte:02X}");
+            }
+        }
+    }
+    uri
 }
 
 #[cfg(target_os = "android")]
@@ -839,6 +871,67 @@ fn android_system_window_insets(
             right,
             bottom,
         }))
+    })
+    .map_err(|error| error.to_string())
+}
+
+#[cfg(target_os = "android")]
+#[allow(unsafe_code)]
+fn android_open_text_uri(
+    app: &winit::platform::android::activity::AndroidApp,
+    uri: &str,
+) -> Result<(), String> {
+    use jni::{
+        JavaVM, jni_sig, jni_str,
+        objects::{JObject, JValue},
+    };
+
+    let vm = unsafe { JavaVM::from_raw(app.vm_as_ptr().cast()) };
+    let activity_raw = app.activity_as_ptr() as jni::sys::jobject;
+
+    vm.attach_current_thread(|env| -> jni::errors::Result<()> {
+        let activity = unsafe { env.as_cast_raw::<JObject>(&activity_raw)? };
+
+        let action = JObject::from(env.new_string("android.intent.action.VIEW")?);
+        let intent = env.new_object(
+            jni_str!("android/content/Intent"),
+            jni_sig!((java.lang.String) -> void),
+            &[JValue::Object(&action)],
+        )?;
+
+        let uri_text = JObject::from(env.new_string(uri)?);
+        let parsed_uri = env
+            .call_static_method(
+                jni_str!("android/net/Uri"),
+                jni_str!("parse"),
+                jni_sig!((java.lang.String) -> android.net.Uri),
+                &[JValue::Object(&uri_text)],
+            )?
+            .l()?;
+        let mime_type = JObject::from(env.new_string("text/plain")?);
+        env.call_method(
+            &intent,
+            jni_str!("setDataAndType"),
+            jni_sig!((android.net.Uri, java.lang.String) -> android.content.Intent),
+            &[JValue::Object(&parsed_uri), JValue::Object(&mime_type)],
+        )?;
+
+        let chooser_title = JObject::from(env.new_string("Open Waker log")?);
+        let chooser = env
+            .call_static_method(
+                jni_str!("android/content/Intent"),
+                jni_str!("createChooser"),
+                jni_sig!((android.content.Intent, java.lang.CharSequence) -> android.content.Intent),
+                &[JValue::Object(&intent), JValue::Object(&chooser_title)],
+            )?
+            .l()?;
+        env.call_method(
+            &activity,
+            jni_str!("startActivity"),
+            jni_sig!((android.content.Intent) -> void),
+            &[JValue::Object(&chooser)],
+        )?;
+        Ok(())
     })
     .map_err(|error| error.to_string())
 }
@@ -1454,6 +1547,12 @@ mod tests {
     }
 
     #[test]
+    fn text_log_uri_percent_encodes_content() {
+        let uri = text_data_uri("line 1\nA&B");
+        assert_eq!(uri, "data:text/plain;charset=utf-8,line%201%0AA%26B");
+    }
+
+    #[test]
     fn attempt_ids_are_monotonic() {
         assert!(next_attempt_id() < next_attempt_id());
     }
@@ -1612,7 +1711,7 @@ mod tests {
             ..WakerApp::default()
         };
         assert!(
-            app.diagnostics_bundle()
+            app.diagnostics_bundle("log tail")
                 .contains("FRITZ!Box host status: offline")
         );
     }
@@ -1648,7 +1747,7 @@ mod tests {
             ..WakerApp::default()
         };
         assert!(
-            app.diagnostics_bundle()
+            app.diagnostics_bundle("log tail")
                 .contains("PC ICMP ping: reply received")
         );
     }
