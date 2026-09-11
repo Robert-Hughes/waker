@@ -24,6 +24,10 @@ pub use diagnostics::DiagnosticsRuntime;
 
 const APP_NAME: &str = "Waker";
 const DIAGNOSTIC_TAIL_BYTES: usize = 64 * 1024;
+#[cfg(not(target_os = "android"))]
+const APP_ICON_PNG: &[u8] = include_bytes!("../../../assets/app-icon.png");
+const BIG_LOGO_PNG: &[u8] = include_bytes!("../../../assets/big-logo.png");
+const BACKGROUND_PNG: &[u8] = include_bytes!("../../../assets/background.png");
 static LAST_ATTEMPT_ID: AtomicU64 = AtomicU64::new(0);
 
 struct ActiveAttempt {
@@ -36,6 +40,11 @@ struct AttemptSummary {
     id: u64,
     elapsed: Duration,
     failure: Option<WakeFailure>,
+}
+
+struct BrandingTextures {
+    logo: egui::TextureHandle,
+    background: egui::TextureHandle,
 }
 
 #[derive(Default)]
@@ -59,6 +68,7 @@ pub struct WakerApp {
     ping_status: Option<Result<bool, String>>,
     diagnostics: DiagnosticsInfo,
     diagnostics_text: String,
+    branding: Option<BrandingTextures>,
 }
 
 impl Default for WakerApp {
@@ -97,7 +107,84 @@ impl WakerApp {
             ping_status: None,
             diagnostics,
             diagnostics_text: String::new(),
+            branding: None,
         }
+    }
+
+    fn install_branding(&mut self, ctx: &egui::Context) {
+        match Self::load_branding(ctx) {
+            Ok(branding) => self.branding = Some(branding),
+            Err(error) => error!(%error, "could not load branding assets"),
+        }
+    }
+
+    fn load_branding(ctx: &egui::Context) -> Result<BrandingTextures, image::ImageError> {
+        fn load_texture(
+            ctx: &egui::Context,
+            name: &'static str,
+            png: &[u8],
+        ) -> Result<egui::TextureHandle, image::ImageError> {
+            let rgba = image::load_from_memory(png)?.into_rgba8();
+            let size = [
+                usize::try_from(rgba.width()).expect("PNG width fits usize"),
+                usize::try_from(rgba.height()).expect("PNG height fits usize"),
+            ];
+            let image = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+            Ok(ctx.load_texture(name, image, egui::TextureOptions::LINEAR))
+        }
+
+        Ok(BrandingTextures {
+            logo: load_texture(ctx, "waker-big-logo", BIG_LOGO_PNG)?,
+            background: load_texture(ctx, "waker-background", BACKGROUND_PNG)?,
+        })
+    }
+
+    fn paint_branding_background(&self, ui: &egui::Ui) {
+        let Some(branding) = &self.branding else {
+            return;
+        };
+        let rect = ui.max_rect();
+        let image_size = branding.background.size_vec2();
+        let target_size = rect.size();
+        if image_size.x <= 0.0
+            || image_size.y <= 0.0
+            || target_size.x <= 0.0
+            || target_size.y <= 0.0
+        {
+            return;
+        }
+
+        let image_aspect = image_size.x / image_size.y;
+        let target_aspect = target_size.x / target_size.y;
+        let uv = if image_aspect > target_aspect {
+            let visible = target_aspect / image_aspect;
+            let margin = (1.0 - visible) / 2.0;
+            egui::Rect::from_min_max(egui::pos2(margin, 0.0), egui::pos2(1.0 - margin, 1.0))
+        } else {
+            let visible = image_aspect / target_aspect;
+            let margin = (1.0 - visible) / 2.0;
+            egui::Rect::from_min_max(egui::pos2(0.0, margin), egui::pos2(1.0, 1.0 - margin))
+        };
+
+        ui.painter().image(
+            branding.background.id(),
+            rect,
+            uv,
+            egui::Color32::from_white_alpha(56),
+        );
+    }
+
+    fn render_branding_logo(&self, ui: &mut egui::Ui) {
+        let Some(branding) = &self.branding else {
+            ui.heading(APP_NAME);
+            return;
+        };
+        let source_size = branding.logo.size_vec2();
+        let width = ui.available_width().min(300.0);
+        let height = width * source_size.y / source_size.x;
+        ui.add(
+            egui::Image::from_texture(&branding.logo).fit_to_exact_size(egui::vec2(width, height)),
+        );
     }
 
     fn begin_wake(&mut self, ctx: &egui::Context) {
@@ -568,9 +655,10 @@ impl eframe::App for WakerApp {
         let ctx = ui.ctx().clone();
 
         egui::CentralPanel::default().show(ui, |ui| {
+            self.paint_branding_background(ui);
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.vertical_centered(|ui| {
-                    ui.heading(APP_NAME);
+                    self.render_branding_logo(ui);
                     ui.add_space(8.0);
 
                     let wake_button = egui::Button::new("Wake").min_size(egui::vec2(160.0, 52.0));
@@ -932,19 +1020,26 @@ pub fn run_desktop(diagnostics_runtime: DiagnosticsRuntime) -> eframe::Result {
         warning = ?diagnostics_info.warning,
         "Waker starting"
     );
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title(APP_NAME)
+        .with_inner_size([460.0, 460.0])
+        .with_min_inner_size([360.0, 320.0]);
+    match eframe::icon_data::from_png_bytes(APP_ICON_PNG) {
+        Ok(icon) => viewport = viewport.with_icon(icon),
+        Err(error) => error!(%error, "could not load desktop app icon"),
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title(APP_NAME)
-            .with_inner_size([460.0, 460.0])
-            .with_min_inner_size([360.0, 320.0]),
+        viewport,
         ..Default::default()
     };
 
     let result = eframe::run_native(
         APP_NAME,
         options,
-        Box::new(move |_creation_context| {
-            Ok(Box::new(WakerApp::new(diagnostics_info.clone(), None)))
+        Box::new(move |creation_context| {
+            let mut app = WakerApp::new(diagnostics_info.clone(), None);
+            app.install_branding(&creation_context.egui_ctx);
+            Ok(Box::new(app))
         }),
     );
     if let Err(error) = &result {
@@ -979,11 +1074,10 @@ pub fn android_main(app: winit::platform::android::activity::AndroidApp) {
     let result = eframe::run_native(
         APP_NAME,
         options,
-        Box::new(move |_creation_context| {
-            Ok(Box::new(WakerApp::new(
-                diagnostics_info.clone(),
-                default_config_path.clone(),
-            )))
+        Box::new(move |creation_context| {
+            let mut app = WakerApp::new(diagnostics_info.clone(), default_config_path.clone());
+            app.install_branding(&creation_context.egui_ctx);
+            Ok(Box::new(app))
         }),
     );
     if let Err(error) = result {

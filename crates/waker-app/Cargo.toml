@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 eframe.workspace = true
+image.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-appender.workspace = true
@@ -29,12 +30,14 @@ tracing-logcat = "0.1.0"
 [package.metadata.android]
 package = "app.waker.android"
 build_targets = ["aarch64-linux-android"]
+resources = "android-res"
 
 [[package.metadata.android.uses_permission]]
 name = "android.permission.INTERNET"
 
 [package.metadata.android.application]
 label = "Waker"
+icon = "@mipmap/ic_launcher"
 
 [[package.metadata.android.application.activity]]
 name = "android.app.NativeActivity"
