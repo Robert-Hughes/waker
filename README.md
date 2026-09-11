@@ -13,7 +13,7 @@ Waker UI (eframe / egui / winit)
 wake state machine (waker-core)
         |
         v
-FRITZ TR-064 + TCP probe (waker-net)
+FRITZ TR-064 + ICMP readiness (waker-net)
         |
         v
 smoltcp userspace TCP/IP stack
@@ -35,17 +35,18 @@ The wake sequence is:
 1. Resolve the configured WireGuard peer endpoint using the normal host network.
 2. Start an in-process GotaTun device and private smoltcp interface.
 3. Open a TCP connection through that private stack to the FRITZ!Box TR-064 service on port 49000. This also causes the WireGuard handshake to occur.
-4. Send `Hosts:1#X_AVM-DE_WakeOnLANByMACAddress` for the configured MAC address.
-5. Repeatedly attempt a TCP connection through the same private stack to the configured PC address/port.
-6. Report success when the PC accepts the connection, or fail after the configured timeout.
-7. Destroy the WireGuard device and private network state.
+4. Call `Hosts:1#GetSpecificHostEntry` for the configured MAC address and obtain the PC's current IPv4 address.
+5. Send `Hosts:1#X_AVM-DE_WakeOnLANByMACAddress` for the same MAC address.
+6. Poll ICMP echo through the same private tunnel to the resolved PC address.
+7. Report success on the first echo reply, or fail after the wake timeout.
+8. Destroy the WireGuard device and private network state.
 
 ## Workspace
 
 - `crates/waker-core`: platform-independent wake state machine and core types.
-- `crates/waker-net`: WireGuard profile parsing, GotaTun/smoltcp bridge, private TCP client, FRITZ TR-064 request, and PC probing.
+- `crates/waker-net`: WireGuard profile parsing, GotaTun/smoltcp bridge, private TCP/ICMP transport, FRITZ TR-064 host lookup/WOL, and readiness probing.
 - `crates/waker-app`: Waker UI and desktop/Android entry points.
-- `crates/waker-lab`: fake FRITZ!Box and fake PC services for end-to-end testing through a local WireGuard peer.
+- `crates/waker-lab`: fake FRITZ!Box service and independent WireGuard/ICMP lab path for end-to-end testing.
 
 The networking and wake crates contain no Android-specific code. Desktop is the primary development and diagnostic target.
 
