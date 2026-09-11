@@ -673,18 +673,17 @@ impl WakerApp {
         let _ = ctx;
         self.clipboard_status = None;
         let text = self.current_log_text();
-        let uri = text_data_uri(&text);
 
         #[cfg(target_os = "android")]
         let result = self
             .android_app
             .as_ref()
             .ok_or_else(|| "Android activity is unavailable".to_owned())
-            .and_then(|app| android_open_text_uri(app, &uri));
+            .and_then(|app| android_open_log(app, &text));
 
         #[cfg(not(target_os = "android"))]
         let result = {
-            ctx.open_url(egui::OpenUrl::same_tab(uri));
+            ctx.open_url(egui::OpenUrl::same_tab(text_data_uri(&text)));
             Ok(())
         };
 
@@ -765,6 +764,7 @@ fn friendly_failure_message(failure: &WakeFailure) -> &'static str {
     }
 }
 
+#[cfg(not(target_os = "android"))]
 fn text_data_uri(text: &str) -> String {
     let mut uri = String::with_capacity("data:text/plain;charset=utf-8,".len() + text.len() * 3);
     uri.push_str("data:text/plain;charset=utf-8,");
@@ -877,9 +877,9 @@ fn android_system_window_insets(
 
 #[cfg(target_os = "android")]
 #[allow(unsafe_code)]
-fn android_open_text_uri(
+fn android_open_log(
     app: &winit::platform::android::activity::AndroidApp,
-    uri: &str,
+    text: &str,
 ) -> Result<(), String> {
     use jni::{
         JavaVM, jni_sig, jni_str,
@@ -891,45 +891,24 @@ fn android_open_text_uri(
 
     vm.attach_current_thread(|env| -> jni::errors::Result<()> {
         let activity = unsafe { env.as_cast_raw::<JObject>(&activity_raw)? };
-
-        let action = JObject::from(env.new_string("android.intent.action.VIEW")?);
-        let intent = env.new_object(
-            jni_str!("android/content/Intent"),
-            jni_sig!((java.lang.String) -> void),
-            &[JValue::Object(&action)],
-        )?;
-
-        let uri_text = JObject::from(env.new_string(uri)?);
-        let parsed_uri = env
-            .call_static_method(
-                jni_str!("android/net/Uri"),
-                jni_str!("parse"),
-                jni_sig!((java.lang.String) -> android.net.Uri),
-                &[JValue::Object(&uri_text)],
+        let class_loader = env
+            .call_method(
+                &activity,
+                jni_str!("getClassLoader"),
+                jni_sig!("()Ljava/lang/ClassLoader;"),
+                &[],
             )?
             .l()?;
-        let mime_type = JObject::from(env.new_string("text/plain")?);
-        env.call_method(
-            &intent,
-            jni_str!("setDataAndType"),
-            jni_sig!((android.net.Uri, java.lang.String) -> android.content.Intent),
-            &[JValue::Object(&parsed_uri), JValue::Object(&mime_type)],
-        )?;
+        let class_loader = env.cast_local::<jni::objects::JClassLoader>(class_loader)?;
+        let helper_name = env.new_string("app.waker.android.LogOpener")?;
+        let helper_class = class_loader.load_class(env, helper_name)?;
+        let text = JObject::from(env.new_string(text)?);
 
-        let chooser_title = JObject::from(env.new_string("Open Waker log")?);
-        let chooser = env
-            .call_static_method(
-                jni_str!("android/content/Intent"),
-                jni_str!("createChooser"),
-                jni_sig!((android.content.Intent, java.lang.CharSequence) -> android.content.Intent),
-                &[JValue::Object(&intent), JValue::Object(&chooser_title)],
-            )?
-            .l()?;
-        env.call_method(
-            &activity,
-            jni_str!("startActivity"),
-            jni_sig!((android.content.Intent) -> void),
-            &[JValue::Object(&chooser)],
+        env.call_static_method(
+            &helper_class,
+            jni_str!("open"),
+            jni_sig!((android.app.Activity, java.lang.String) -> void),
+            &[JValue::Object(&activity), JValue::Object(&text)],
         )?;
         Ok(())
     })
@@ -1492,6 +1471,9 @@ pub fn android_main(app: winit::platform::android::activity::AndroidApp) {
         warning = ?diagnostics_info.warning,
         "Waker starting"
     );
+    if let Err(error) = android_open_log(&app, "Waker Open log integration test\n") {
+        error!(%error, "temporary Open log integration test failed");
+    }
     let clipboard_app = app.clone();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_title(APP_NAME),
