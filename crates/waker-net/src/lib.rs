@@ -801,12 +801,56 @@ async fn resolve_endpoint(endpoint: &str) -> Result<SocketAddr, NetError> {
         return Ok(address);
     }
 
-    let mut resolved = tokio::net::lookup_host(endpoint)
-        .await
-        .map_err(|error| NetError::Network(format!("could not resolve {endpoint}: {error}")))?;
-    resolved
-        .next()
-        .ok_or_else(|| NetError::Network(format!("endpoint {endpoint} resolved to no addresses")))
+    let resolved = tokio::net::lookup_host(endpoint).await.map_err(|error| {
+        NetError::Network(format!(
+            "WireGuard endpoint DNS lookup failed for {endpoint}: {error}. Check the current network's DNS/internet access."
+        ))
+    })?;
+
+    let mut rejected = Vec::new();
+    for address in resolved {
+        if let Some(reason) = suspicious_dns_result(address.ip()) {
+            rejected.push((address.ip(), reason));
+        } else {
+            return Ok(address);
+        }
+    }
+
+    if let Some((address, reason)) = rejected.first() {
+        return Err(NetError::Network(format!(
+            "WireGuard endpoint DNS for {endpoint} resolved to {address}, which {reason}. The current network may be filtering or blocking the MyFRITZ hostname; try mobile data or another network."
+        )));
+    }
+
+    Err(NetError::Network(format!(
+        "WireGuard endpoint DNS lookup for {endpoint} returned no addresses"
+    )))
+}
+
+fn suspicious_dns_result(address: IpAddr) -> Option<&'static str> {
+    let ipv4 = match address {
+        IpAddr::V4(address) => Some(address),
+        IpAddr::V6(address) => address.to_ipv4_mapped(),
+    };
+
+    if let Some(address) = ipv4 {
+        let octets = address.octets();
+        if octets[..3] == [146, 112, 61] && matches!(octets[3], 104 | 105 | 106 | 107 | 108 | 110) {
+            return Some("is a Cisco Umbrella/OpenDNS block-page address");
+        }
+    }
+
+    if address.is_unspecified() {
+        return Some("is an unusable unspecified address");
+    }
+    if address.is_loopback() {
+        return Some("is a loopback address rather than the configured internet endpoint");
+    }
+    if address.is_multicast() {
+        return Some("is a multicast address rather than the configured internet endpoint");
+    }
+
+    None
 }
 
 const FRITZ_HOSTS_SERVICE: &str = "urn:dslforum-org:service:Hosts:1";
@@ -1159,5 +1203,23 @@ PersistentKeepalive = 25
     fn rejects_missing_fritz_host_ipv4_address() {
         let response = b"HTTP/1.1 200 OK\r\n\r\n<NewActive>1</NewActive>";
         assert!(fritz_host_ip(response).is_err());
+    }
+    #[test]
+    fn recognises_cisco_umbrella_block_page_addresses() {
+        for last in [104, 105, 106, 107, 108, 110] {
+            let address = IpAddr::V4(Ipv4Addr::new(146, 112, 61, last));
+            assert_eq!(
+                suspicious_dns_result(address),
+                Some("is a Cisco Umbrella/OpenDNS block-page address")
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_normal_public_dns_results() {
+        assert_eq!(
+            suspicious_dns_result(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))),
+            None
+        );
     }
 }

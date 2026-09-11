@@ -26,6 +26,7 @@ winit.workspace = true
 
 [target.'cfg(target_os = "android")'.dependencies]
 tracing-logcat = "0.1.0"
+jni = "0.22.4"
 
 [package.metadata.android]
 package = "app.waker.android"

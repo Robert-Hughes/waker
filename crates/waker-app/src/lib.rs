@@ -69,6 +69,9 @@ pub struct WakerApp {
     diagnostics: DiagnosticsInfo,
     diagnostics_text: String,
     branding: Option<BrandingTextures>,
+    clipboard_status: Option<Result<(), String>>,
+    #[cfg(target_os = "android")]
+    android_app: Option<winit::platform::android::activity::AndroidApp>,
 }
 
 impl Default for WakerApp {
@@ -108,6 +111,9 @@ impl WakerApp {
             diagnostics,
             diagnostics_text: String::new(),
             branding: None,
+            clipboard_status: None,
+            #[cfg(target_os = "android")]
+            android_app: None,
         }
     }
 
@@ -432,7 +438,10 @@ impl WakerApp {
     fn render_status(&self, ui: &mut egui::Ui) {
         match &self.state {
             WakeState::Failed(failure) => {
-                ui.colored_label(ui.visuals().error_fg_color, failure.user_message());
+                ui.colored_label(
+                    ui.visuals().error_fg_color,
+                    friendly_failure_message(failure),
+                );
                 if let Some(summary) = &self.last_attempt {
                     ui.small(format!(
                         "Attempt #{} failed after {}",
@@ -518,9 +527,22 @@ impl WakerApp {
                         &self.diagnostics,
                         DIAGNOSTIC_TAIL_BYTES,
                     ));
-                    ctx.copy_text(self.diagnostics_bundle());
+                    self.copy_diagnostics_to_clipboard(ctx);
                 }
             });
+            if let Some(status) = &self.clipboard_status {
+                match status {
+                    Ok(()) => {
+                        ui.small("Diagnostics copied to clipboard");
+                    }
+                    Err(error) => {
+                        ui.colored_label(
+                            ui.visuals().error_fg_color,
+                            format!("Could not copy diagnostics: {error}"),
+                        );
+                    }
+                }
+            }
 
             if !self.diagnostics_text.is_empty() {
                 egui::ScrollArea::vertical()
@@ -608,6 +630,26 @@ impl WakerApp {
         );
     }
 
+    fn copy_diagnostics_to_clipboard(&mut self, ctx: &egui::Context) {
+        #[cfg(target_os = "android")]
+        let _ = ctx;
+        let text = self.diagnostics_bundle();
+        #[cfg(target_os = "android")]
+        let result = self
+            .android_app
+            .as_ref()
+            .ok_or_else(|| "Android activity is unavailable".to_owned())
+            .and_then(|app| android_copy_text(app, &text));
+
+        #[cfg(not(target_os = "android"))]
+        let result = {
+            ctx.copy_text(text);
+            Ok(())
+        };
+
+        self.clipboard_status = Some(result);
+    }
+
     fn diagnostics_bundle(&self) -> String {
         let mut output = String::from("Waker diagnostics\n");
         if let Some(summary) = &self.last_attempt {
@@ -615,7 +657,7 @@ impl WakerApp {
                 Some(failure) => format!(
                     "failed ({}) - {}",
                     failure.stage.log_name(),
-                    failure.user_message()
+                    friendly_failure_message(failure)
                 ),
                 None => "succeeded".to_owned(),
             };
@@ -645,6 +687,68 @@ impl WakerApp {
         output.push_str(&self.diagnostics_text);
         sanitize_diagnostics(&output)
     }
+}
+
+fn friendly_failure_message(failure: &WakeFailure) -> &'static str {
+    if failure
+        .detail
+        .contains("Cisco Umbrella/OpenDNS block-page address")
+    {
+        "Network DNS is blocking the WireGuard endpoint"
+    } else if failure.detail.contains("WireGuard endpoint DNS") {
+        "Could not resolve the WireGuard endpoint"
+    } else {
+        failure.user_message()
+    }
+}
+
+#[cfg(target_os = "android")]
+#[allow(unsafe_code)]
+fn android_copy_text(
+    app: &winit::platform::android::activity::AndroidApp,
+    text: &str,
+) -> Result<(), String> {
+    use jni::{
+        JavaVM, jni_sig, jni_str,
+        objects::{JObject, JValue},
+    };
+
+    let vm = unsafe { JavaVM::from_raw(app.vm_as_ptr().cast()) };
+    let activity_raw = app.activity_as_ptr() as jni::sys::jobject;
+
+    vm.attach_current_thread(|env| -> jni::errors::Result<()> {
+        let activity = unsafe { env.as_cast_raw::<JObject>(&activity_raw)? };
+
+        let service_name = JObject::from(env.new_string("clipboard")?);
+        let clipboard = env
+            .call_method(
+                activity,
+                jni_str!("getSystemService"),
+                jni_sig!((java.lang.String) -> java.lang.Object),
+                &[JValue::Object(&service_name)],
+            )?
+            .l()?;
+
+        let label = JObject::from(env.new_string("Waker diagnostics")?);
+        let clipboard_text = JObject::from(env.new_string(text)?);
+        let clip = env
+            .call_static_method(
+                jni_str!("android/content/ClipData"),
+                jni_str!("newPlainText"),
+                jni_sig!((java.lang.CharSequence, java.lang.CharSequence) -> android.content.ClipData),
+                &[JValue::Object(&label), JValue::Object(&clipboard_text)],
+            )?
+            .l()?;
+
+        env.call_method(
+            clipboard,
+            jni_str!("setPrimaryClip"),
+            jni_sig!((android.content.ClipData) -> void),
+            &[JValue::Object(&clip)],
+        )?;
+        Ok(())
+    })
+    .map_err(|error| error.to_string())
 }
 
 impl eframe::App for WakerApp {
@@ -1065,6 +1169,7 @@ pub fn android_main(app: winit::platform::android::activity::AndroidApp) {
         warning = ?diagnostics_info.warning,
         "Waker starting"
     );
+    let clipboard_app = app.clone();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_title(APP_NAME),
         android_app: Some(app),
@@ -1077,6 +1182,7 @@ pub fn android_main(app: winit::platform::android::activity::AndroidApp) {
         Box::new(move |creation_context| {
             let mut app = WakerApp::new(diagnostics_info.clone(), default_config_path.clone());
             app.install_branding(&creation_context.egui_ctx);
+            app.android_app = Some(clipboard_app.clone());
             Ok(Box::new(app))
         }),
     );
@@ -1165,6 +1271,30 @@ mod tests {
         assert!(
             app.diagnostics_bundle()
                 .contains("FRITZ!Box host status: offline")
+        );
+    }
+
+    #[test]
+    fn umbrella_dns_failure_has_helpful_heading() {
+        let failure = WakeFailure::new(
+            WakeFailureStage::Connect,
+            "network error: WireGuard endpoint DNS for example.myfritz.net:51820 resolved to 146.112.61.104, which is a Cisco Umbrella/OpenDNS block-page address.",
+        );
+        assert_eq!(
+            friendly_failure_message(&failure),
+            "Network DNS is blocking the WireGuard endpoint"
+        );
+    }
+
+    #[test]
+    fn ordinary_dns_failure_has_helpful_heading() {
+        let failure = WakeFailure::new(
+            WakeFailureStage::Connect,
+            "network error: WireGuard endpoint DNS lookup failed for example.myfritz.net:51820",
+        );
+        assert_eq!(
+            friendly_failure_message(&failure),
+            "Could not resolve the WireGuard endpoint"
         );
     }
 
