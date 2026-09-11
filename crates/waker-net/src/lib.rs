@@ -974,16 +974,43 @@ impl WakerWireGuardBackend {
     ///
     /// Returns an error if host lookup fails, the FRITZ!Box does not return a usable IPv4
     /// address, or the private userspace stack cannot perform the ping.
-    pub async fn ping_host(&self, mac: MacAddress) -> Result<bool, WakeBackendError> {
+    pub async fn host_ipv4(&self, mac: MacAddress) -> Result<Ipv4Addr, WakeBackendError> {
         let response = self.host_entry(mac).await?;
-        let target = fritz_host_ip(&response).map_err(to_backend_error)?;
+        fritz_host_ip(&response).map_err(to_backend_error)
+    }
+
+    /// Send one ICMP echo to an already-resolved IPv4 address through the private tunnel.
+    ///
+    /// The `WireGuard` tunnel must already be connected.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the private userspace stack cannot perform the ping.
+    pub async fn ping_ipv4(
+        &self,
+        target: Ipv4Addr,
+        timeout: Duration,
+    ) -> Result<bool, WakeBackendError> {
         let reachable = self
             .tunnel()?
-            .ping(target, Duration::from_secs(2))
+            .ping(target, timeout)
             .await
             .map_err(to_backend_error)?;
         debug!(reachable, "PC ICMP ping completed");
         Ok(reachable)
+    }
+
+    /// Resolve the target host through the FRITZ!Box Hosts service, then send one ICMP echo.
+    ///
+    /// The `WireGuard` tunnel must already be connected.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if host lookup fails, the FRITZ!Box does not return a usable IPv4
+    /// address, or the private userspace stack cannot perform the ping.
+    pub async fn ping_host(&self, mac: MacAddress) -> Result<bool, WakeBackendError> {
+        let target = self.host_ipv4(mac).await?;
+        self.ping_ipv4(target, Duration::from_secs(2)).await
     }
 }
 
