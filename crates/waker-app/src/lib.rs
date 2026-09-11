@@ -72,6 +72,8 @@ pub struct WakerApp {
     clipboard_status: Option<Result<(), String>>,
     #[cfg(target_os = "android")]
     android_app: Option<winit::platform::android::activity::AndroidApp>,
+    #[cfg(target_os = "android")]
+    android_system_insets: Option<AndroidSystemInsets>,
 }
 
 impl Default for WakerApp {
@@ -114,6 +116,8 @@ impl WakerApp {
             clipboard_status: None,
             #[cfg(target_os = "android")]
             android_app: None,
+            #[cfg(target_os = "android")]
+            android_system_insets: None,
         }
     }
 
@@ -149,48 +153,49 @@ impl WakerApp {
         let Some(branding) = &self.branding else {
             return;
         };
-        let rect = ui.max_rect();
+
+        // Fill the panel width while preserving the artwork's aspect ratio, then
+        // anchor it to the bottom. Any unused height remains plain panel fill.
+        let panel_rect = ui.max_rect().expand(8.0);
         let image_size = branding.background.size_vec2();
-        let target_size = rect.size();
-        if image_size.x <= 0.0
-            || image_size.y <= 0.0
-            || target_size.x <= 0.0
-            || target_size.y <= 0.0
-        {
+        if image_size.x <= 0.0 || image_size.y <= 0.0 || panel_rect.width() <= 0.0 {
             return;
         }
 
-        let image_aspect = image_size.x / image_size.y;
-        let target_aspect = target_size.x / target_size.y;
-        let uv = if image_aspect > target_aspect {
-            let visible = target_aspect / image_aspect;
-            let margin = (1.0 - visible) / 2.0;
-            egui::Rect::from_min_max(egui::pos2(margin, 0.0), egui::pos2(1.0 - margin, 1.0))
-        } else {
-            let visible = image_aspect / target_aspect;
-            let margin = (1.0 - visible) / 2.0;
-            egui::Rect::from_min_max(egui::pos2(0.0, margin), egui::pos2(1.0, 1.0 - margin))
-        };
+        let scale = panel_rect.width() / image_size.x;
+        let draw_size = image_size * scale;
+        let draw_rect = egui::Rect::from_min_size(
+            egui::pos2(panel_rect.left(), panel_rect.bottom() - draw_size.y),
+            draw_size,
+        );
 
         ui.painter().image(
             branding.background.id(),
-            rect,
-            uv,
+            draw_rect,
+            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
             egui::Color32::from_white_alpha(56),
         );
     }
 
     fn render_branding_logo(&self, ui: &mut egui::Ui) {
+        const LOGO_MARGIN: f32 = 16.0;
         let Some(branding) = &self.branding else {
             ui.heading(APP_NAME);
             return;
         };
         let source_size = branding.logo.size_vec2();
-        let width = ui.available_width().min(300.0);
+        let available_width = (ui.available_width() - 2.0 * LOGO_MARGIN).max(0.0);
+        let width = available_width.min(300.0);
+        if source_size.x <= 0.0 || source_size.y <= 0.0 || width <= 0.0 {
+            return;
+        }
+
         let height = width * source_size.y / source_size.x;
+        ui.add_space(LOGO_MARGIN);
         ui.add(
             egui::Image::from_texture(&branding.logo).fit_to_exact_size(egui::vec2(width, height)),
         );
+        ui.add_space(LOGO_MARGIN);
     }
 
     fn begin_wake(&mut self, ctx: &egui::Context) {
@@ -703,6 +708,100 @@ fn friendly_failure_message(failure: &WakeFailure) -> &'static str {
 }
 
 #[cfg(target_os = "android")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct AndroidSystemInsets {
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+}
+
+#[cfg(target_os = "android")]
+#[allow(unsafe_code)]
+fn android_system_window_insets(
+    app: &winit::platform::android::activity::AndroidApp,
+) -> Result<Option<AndroidSystemInsets>, String> {
+    use jni::{JavaVM, jni_sig, jni_str, objects::JObject};
+
+    let vm = unsafe { JavaVM::from_raw(app.vm_as_ptr().cast()) };
+    let activity_raw = app.activity_as_ptr() as jni::sys::jobject;
+
+    vm.attach_current_thread(|env| -> jni::errors::Result<Option<AndroidSystemInsets>> {
+        let activity = unsafe { env.as_cast_raw::<JObject>(&activity_raw)? };
+        let window = env
+            .call_method(
+                &activity,
+                jni_str!("getWindow"),
+                jni_sig!("()Landroid/view/Window;"),
+                &[],
+            )?
+            .l()?;
+        let decor = env
+            .call_method(
+                &window,
+                jni_str!("getDecorView"),
+                jni_sig!("()Landroid/view/View;"),
+                &[],
+            )?
+            .l()?;
+        let insets = env
+            .call_method(
+                &decor,
+                jni_str!("getRootWindowInsets"),
+                jni_sig!("()Landroid/view/WindowInsets;"),
+                &[],
+            )?
+            .l()?;
+        if insets.is_null() {
+            return Ok(None);
+        }
+
+        // These accessors are available throughout Waker's supported Android range
+        // (API 24+) and remain equivalent to the system-bars inset for this purpose.
+        let left = env
+            .call_method(
+                &insets,
+                jni_str!("getSystemWindowInsetLeft"),
+                jni_sig!("()I"),
+                &[],
+            )?
+            .i()?;
+        let top = env
+            .call_method(
+                &insets,
+                jni_str!("getSystemWindowInsetTop"),
+                jni_sig!("()I"),
+                &[],
+            )?
+            .i()?;
+        let right = env
+            .call_method(
+                &insets,
+                jni_str!("getSystemWindowInsetRight"),
+                jni_sig!("()I"),
+                &[],
+            )?
+            .i()?;
+        let bottom = env
+            .call_method(
+                &insets,
+                jni_str!("getSystemWindowInsetBottom"),
+                jni_sig!("()I"),
+                &[],
+            )?
+            .i()?;
+
+        Ok(Some(AndroidSystemInsets {
+            left,
+            top,
+            right,
+            bottom,
+        }))
+    })
+    .map_err(|error| error.to_string())
+}
+
+#[cfg(target_os = "android")]
 #[allow(unsafe_code)]
 fn android_copy_text(
     app: &winit::platform::android::activity::AndroidApp,
@@ -752,53 +851,125 @@ fn android_copy_text(
 }
 
 impl eframe::App for WakerApp {
+    #[cfg(target_os = "android")]
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        let Some(android_app) = &self.android_app else {
+            return;
+        };
+        let Ok(Some(insets)) = android_system_window_insets(android_app) else {
+            return;
+        };
+
+        if self.android_system_insets != Some(insets) {
+            info!(
+                left = insets.left,
+                top = insets.top,
+                right = insets.right,
+                bottom = insets.bottom,
+                "Android system-bar insets changed"
+            );
+            self.android_system_insets = Some(insets);
+        }
+
+        let native_pixels_per_point = raw_input
+            .viewports
+            .get(&raw_input.viewport_id)
+            .and_then(|viewport| viewport.native_pixels_per_point)
+            .unwrap_or(1.0);
+        let pixels_per_point = native_pixels_per_point * ctx.zoom_factor();
+        if pixels_per_point <= 0.0 {
+            return;
+        }
+
+        raw_input.safe_area_insets = Some(egui::SafeAreaInsets(egui::epaint::MarginF32 {
+            left: insets.left.max(0) as f32 / pixels_per_point,
+            top: insets.top.max(0) as f32 / pixels_per_point,
+            right: insets.right.max(0) as f32 / pixels_per_point,
+            bottom: insets.bottom.max(0) as f32 / pixels_per_point,
+        }));
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_state_updates();
         self.drain_host_status_update();
         self.drain_ping_update();
         let ctx = ui.ctx().clone();
 
-        egui::CentralPanel::default().show(ui, |ui| {
-            self.paint_branding_background(ui);
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.vertical_centered(|ui| {
-                    self.render_branding_logo(ui);
-                    ui.add_space(8.0);
+        #[cfg(target_os = "android")]
+        {
+            let viewport = ctx.viewport_rect();
+            let content = ctx.content_rect();
+            let fill = ui.visuals().panel_fill;
+            let painter = egui::Painter::new(
+                ctx.clone(),
+                egui::LayerId::new(
+                    egui::Order::Foreground,
+                    egui::Id::new("android-system-chrome-background"),
+                ),
+                viewport,
+            );
+            let system_chrome_rects = [
+                egui::Rect::from_min_max(viewport.min, egui::pos2(viewport.max.x, content.min.y)),
+                egui::Rect::from_min_max(egui::pos2(viewport.min.x, content.max.y), viewport.max),
+                egui::Rect::from_min_max(
+                    egui::pos2(viewport.min.x, content.min.y),
+                    egui::pos2(content.min.x, content.max.y),
+                ),
+                egui::Rect::from_min_max(
+                    egui::pos2(content.max.x, content.min.y),
+                    egui::pos2(viewport.max.x, content.max.y),
+                ),
+            ];
+            for rect in system_chrome_rects {
+                if rect.width() > 0.0 && rect.height() > 0.0 {
+                    painter.rect_filled(rect, 0.0, fill);
+                }
+            }
+        }
 
-                    let wake_button = egui::Button::new("Wake").min_size(egui::vec2(160.0, 52.0));
-                    if ui
-                        .add_enabled(
-                            !self.busy
-                                && self.status_check_rx.is_none()
-                                && self.ping_check_rx.is_none(),
-                            wake_button,
-                        )
-                        .clicked()
-                    {
-                        self.begin_wake(&ctx);
-                    }
+        ui.scope_builder(egui::UiBuilder::new().max_rect(ctx.content_rect()), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                self.paint_branding_background(ui);
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.vertical_centered(|ui| {
+                        self.render_branding_logo(ui);
 
-                    ui.add_space(6.0);
-                    self.render_status(ui);
-                });
+                        let wake_button =
+                            egui::Button::new("Wake").min_size(egui::vec2(160.0, 52.0));
+                        if ui
+                            .add_enabled(
+                                !self.busy
+                                    && self.status_check_rx.is_none()
+                                    && self.ping_check_rx.is_none(),
+                                wake_button,
+                            )
+                            .clicked()
+                        {
+                            self.begin_wake(&ctx);
+                        }
 
-                ui.add_space(16.0);
-                ui.separator();
-                ui.collapsing("Development settings", |ui| {
-                    ui.label("WireGuard profile");
-                    ui.text_edit_singleline(&mut self.config_path);
-
-                    ui.horizontal(|ui| {
-                        ui.label("FRITZ!Box");
-                        ui.text_edit_singleline(&mut self.fritz_ip);
+                        ui.add_space(6.0);
+                        self.render_status(ui);
                     });
-                    ui.horizontal(|ui| {
-                        ui.label("PC MAC");
-                        ui.text_edit_singleline(&mut self.pc_mac);
+
+                    ui.add_space(16.0);
+                    ui.separator();
+                    ui.collapsing("Development settings", |ui| {
+                        ui.label("WireGuard profile");
+                        ui.text_edit_singleline(&mut self.config_path);
+
+                        ui.horizontal(|ui| {
+                            ui.label("FRITZ!Box");
+                            ui.text_edit_singleline(&mut self.fritz_ip);
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("PC MAC");
+                            ui.text_edit_singleline(&mut self.pc_mac);
+                        });
                     });
+                    ui.separator();
+                    self.render_diagnostics(ui, &ctx);
                 });
-                ui.separator();
-                self.render_diagnostics(ui, &ctx);
             });
         });
     }
