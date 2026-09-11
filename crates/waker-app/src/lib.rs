@@ -28,6 +28,7 @@ const DIAGNOSTIC_TAIL_BYTES: usize = 64 * 1024;
 const APP_ICON_PNG: &[u8] = include_bytes!("../../../assets/app-icon.png");
 const BIG_LOGO_PNG: &[u8] = include_bytes!("../../../assets/big-logo.png");
 const BACKGROUND_PNG: &[u8] = include_bytes!("../../../assets/background.png");
+const TERMINAL_STATE_DISPLAY_DURATION: Duration = Duration::from_secs(5);
 static LAST_ATTEMPT_ID: AtomicU64 = AtomicU64::new(0);
 
 struct ActiveAttempt {
@@ -37,7 +38,6 @@ struct ActiveAttempt {
 
 #[derive(Clone)]
 struct AttemptSummary {
-    id: u64,
     elapsed: Duration,
     failure: Option<WakeFailure>,
 }
@@ -62,10 +62,13 @@ pub struct WakerApp {
     busy: bool,
     active_attempt: Option<ActiveAttempt>,
     last_attempt: Option<AttemptSummary>,
+    terminal_state_deadline: Option<Instant>,
     status_check_rx: Option<Receiver<Result<bool, String>>>,
     host_status: Option<Result<bool, String>>,
+    host_status_deadline: Option<Instant>,
     ping_check_rx: Option<Receiver<Result<bool, String>>>,
     ping_status: Option<Result<bool, String>>,
+    ping_status_deadline: Option<Instant>,
     diagnostics: DiagnosticsInfo,
     diagnostics_text: String,
     branding: Option<BrandingTextures>,
@@ -106,10 +109,13 @@ impl WakerApp {
             busy: false,
             active_attempt: None,
             last_attempt: None,
+            terminal_state_deadline: None,
             status_check_rx: None,
             host_status: None,
+            host_status_deadline: None,
             ping_check_rx: None,
             ping_status: None,
+            ping_status_deadline: None,
             diagnostics,
             diagnostics_text: String::new(),
             branding: None,
@@ -199,6 +205,7 @@ impl WakerApp {
     }
 
     fn begin_wake(&mut self, ctx: &egui::Context) {
+        self.terminal_state_deadline = None;
         let attempt_id = next_attempt_id();
         self.active_attempt = Some(ActiveAttempt {
             id: attempt_id,
@@ -259,6 +266,7 @@ impl WakerApp {
         if self.busy || self.status_check_rx.is_some() || self.ping_check_rx.is_some() {
             return;
         }
+        self.host_status_deadline = None;
         info!("FRITZ!Box host status check requested");
 
         match self.build_fritz_job() {
@@ -280,11 +288,16 @@ impl WakerApp {
                     self.status_check_rx = None;
                     self.host_status =
                         Some(Err(format!("Could not create worker thread: {error}")));
+                    self.host_status_deadline =
+                        Some(Instant::now() + TERMINAL_STATE_DISPLAY_DURATION);
+                    ctx.request_repaint_after(TERMINAL_STATE_DISPLAY_DURATION);
                 }
             }
             Err(message) => {
                 error!(detail = %message, "host status check rejected");
                 self.host_status = Some(Err(message));
+                self.host_status_deadline = Some(Instant::now() + TERMINAL_STATE_DISPLAY_DURATION);
+                ctx.request_repaint_after(TERMINAL_STATE_DISPLAY_DURATION);
             }
         }
     }
@@ -293,6 +306,7 @@ impl WakerApp {
         if self.busy || self.status_check_rx.is_some() || self.ping_check_rx.is_some() {
             return;
         }
+        self.ping_status_deadline = None;
         info!("PC ICMP ping requested");
 
         match self.build_fritz_job() {
@@ -305,11 +319,16 @@ impl WakerApp {
                     self.ping_check_rx = None;
                     self.ping_status =
                         Some(Err(format!("Could not create worker thread: {error}")));
+                    self.ping_status_deadline =
+                        Some(Instant::now() + TERMINAL_STATE_DISPLAY_DURATION);
+                    ctx.request_repaint_after(TERMINAL_STATE_DISPLAY_DURATION);
                 }
             }
             Err(message) => {
                 error!(detail = %message, "PC ICMP ping rejected");
                 self.ping_status = Some(Err(message));
+                self.ping_status_deadline = Some(Instant::now() + TERMINAL_STATE_DISPLAY_DURATION);
+                ctx.request_repaint_after(TERMINAL_STATE_DISPLAY_DURATION);
             }
         }
     }
@@ -403,6 +422,7 @@ impl WakerApp {
 
         if let Some(result) = update {
             self.host_status = Some(result);
+            self.host_status_deadline = Some(Instant::now() + TERMINAL_STATE_DISPLAY_DURATION);
             self.status_check_rx = None;
         }
     }
@@ -421,6 +441,7 @@ impl WakerApp {
 
         if let Some(result) = update {
             self.ping_status = Some(result);
+            self.ping_status_deadline = Some(Instant::now() + TERMINAL_STATE_DISPLAY_DURATION);
             self.ping_check_rx = None;
         }
     }
@@ -434,201 +455,223 @@ impl WakerApp {
             _ => None,
         };
         self.last_attempt = Some(AttemptSummary {
-            id: active.id,
             elapsed: active.started.elapsed(),
             failure,
         });
+        if matches!(self.state, WakeState::Awake | WakeState::Failed(_)) {
+            self.terminal_state_deadline = Some(Instant::now() + TERMINAL_STATE_DISPLAY_DURATION);
+        }
     }
 
-    fn render_status(&self, ui: &mut egui::Ui) {
+    fn update_terminal_state_timeout(&mut self, now: Instant) -> Option<Duration> {
+        let deadline = self.terminal_state_deadline?;
+
+        if !matches!(self.state, WakeState::Awake | WakeState::Failed(_)) {
+            self.terminal_state_deadline = None;
+            return None;
+        }
+
+        if now >= deadline {
+            self.state = WakeState::Idle;
+            self.terminal_state_deadline = None;
+            None
+        } else {
+            Some(deadline.duration_since(now))
+        }
+    }
+
+    fn update_diagnostic_result_timeouts(&mut self, now: Instant) -> Option<Duration> {
+        let mut next_repaint: Option<Duration> = None;
+
+        for deadline in [
+            &mut self.host_status_deadline,
+            &mut self.ping_status_deadline,
+        ] {
+            let Some(value) = *deadline else {
+                continue;
+            };
+            if now >= value {
+                *deadline = None;
+            } else {
+                let remaining = value.duration_since(now);
+                next_repaint = Some(match next_repaint {
+                    Some(current) => current.min(remaining),
+                    None => remaining,
+                });
+            }
+        }
+
+        next_repaint
+    }
+
+    fn host_status_button_label(&self) -> &'static str {
+        if self.status_check_rx.is_some() {
+            return "Checking FRITZ!Box…";
+        }
+        if self.host_status_deadline.is_some() {
+            match self.host_status.as_ref() {
+                Some(Ok(true)) => return "PC online",
+                Some(Ok(false)) => return "PC offline",
+                Some(Err(_)) | None => {}
+            }
+        }
+        "Check PC via FRITZ!Box API"
+    }
+
+    fn ping_button_label(&self) -> &'static str {
+        if self.ping_check_rx.is_some() {
+            return "Pinging PC…";
+        }
+        if self.ping_status_deadline.is_some() {
+            match self.ping_status.as_ref() {
+                Some(Ok(true)) => return "PC replied",
+                Some(Ok(false)) => return "No ICMP reply",
+                Some(Err(_)) | None => {}
+            }
+        }
+        "Ping PC through tunnel"
+    }
+
+    fn diagnostic_action_enabled(&self) -> bool {
+        !self.busy && self.status_check_rx.is_none() && self.ping_check_rx.is_none()
+    }
+
+    fn wake_button_label(&self) -> &'static str {
         match &self.state {
-            WakeState::Failed(failure) => {
-                ui.colored_label(
-                    ui.visuals().error_fg_color,
-                    friendly_failure_message(failure),
-                );
-                if let Some(summary) = &self.last_attempt {
-                    ui.small(format!(
-                        "Attempt #{} failed after {}",
-                        summary.id,
-                        format_duration(summary.elapsed)
-                    ));
-                }
-                ui.collapsing("Details", |ui| {
-                    ui.monospace(format!(
-                        "Stage: {}\n{}",
-                        failure.stage.log_name(),
-                        failure.detail
-                    ));
-                });
-            }
-            WakeState::Awake => {
-                ui.strong("PC awake");
-                if let Some(summary) = &self.last_attempt {
-                    ui.small(format!(
-                        "Attempt #{} completed in {}",
-                        summary.id,
-                        format_duration(summary.elapsed)
-                    ));
-                }
-            }
-            state if self.busy => {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label(state.label());
-                });
-                if let Some(active) = &self.active_attempt {
-                    ui.small(format!("Attempt #{}", active.id));
-                }
-            }
-            state => {
-                ui.label(state.label());
-            }
+            WakeState::Idle | WakeState::Failed(_) => "Wake",
+            WakeState::Connecting => "Connecting…",
+            WakeState::ResolvingPc => "Finding PC…",
+            WakeState::Waking => "Sending wake request…",
+            WakeState::WaitingForPc { .. } => "Waiting for PC…",
+            WakeState::Awake => "PC awake",
+        }
+    }
+
+    fn render_wake_error(&self, ui: &mut egui::Ui) {
+        if let WakeState::Failed(failure) = &self.state {
+            ui.colored_label(
+                ui.visuals().error_fg_color,
+                friendly_failure_message(failure),
+            );
         }
     }
 
     fn render_diagnostics(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.collapsing("Diagnostics", |ui| {
-            if let Some(summary) = &self.last_attempt {
-                let outcome = if summary.failure.is_some() {
-                    "failed"
+        ui.scope(|ui| {
+            ui.visuals_mut().collapsing_header_frame = true;
+            ui.collapsing("Diagnostics", |ui| {
+                if let Some(summary) = &self.last_attempt {
+                    let outcome = if summary.failure.is_some() {
+                        "failed"
+                    } else {
+                        "succeeded"
+                    };
+                    ui.label(format!(
+                        "Last wake {outcome} in {}",
+                        format_duration(summary.elapsed)
+                    ));
                 } else {
-                    "succeeded"
-                };
-                ui.label(format!(
-                    "Last attempt: #{} {outcome} in {}",
-                    summary.id,
-                    format_duration(summary.elapsed)
-                ));
-            } else {
-                ui.label("No wake attempt has completed in this session.");
-            }
-
-            if let Some(log_dir) = &self.diagnostics.log_dir {
-                ui.small(format!("Persistent log directory: {}", log_dir.display()));
-                ui.small("Retention: seven daily log files");
-            } else {
-                ui.small("Persistent log unavailable");
-            }
-            if let Some(warning) = &self.diagnostics.warning {
-                ui.colored_label(ui.visuals().warn_fg_color, warning);
-            }
-
-            ui.separator();
-            self.render_fritz_status_diagnostic(ui, ctx);
-            ui.separator();
-            self.render_ping_diagnostic(ui, ctx);
-            ui.separator();
-
-            ui.horizontal(|ui| {
-                if ui.button("Refresh log").clicked() {
-                    self.diagnostics_text = sanitize_diagnostics(&recent_log_tail(
-                        &self.diagnostics,
-                        DIAGNOSTIC_TAIL_BYTES,
-                    ));
+                    ui.label("No wake has completed in this session.");
                 }
-                if ui.button("Copy diagnostics").clicked() {
-                    self.diagnostics_text = sanitize_diagnostics(&recent_log_tail(
-                        &self.diagnostics,
-                        DIAGNOSTIC_TAIL_BYTES,
-                    ));
-                    self.copy_diagnostics_to_clipboard(ctx);
+
+                if let Some(log_dir) = &self.diagnostics.log_dir {
+                    ui.small(format!("Persistent log directory: {}", log_dir.display()));
+                    ui.small("Retention: seven daily log files");
+                } else {
+                    ui.small("Persistent log unavailable");
+                }
+                if let Some(warning) = &self.diagnostics.warning {
+                    ui.colored_label(ui.visuals().warn_fg_color, warning);
+                }
+
+                ui.separator();
+                self.render_fritz_status_diagnostic(ui, ctx);
+                ui.separator();
+                self.render_ping_diagnostic(ui, ctx);
+                ui.separator();
+
+                ui.horizontal(|ui| {
+                    if ui.button("Refresh log").clicked() {
+                        self.diagnostics_text = sanitize_diagnostics(&recent_log_tail(
+                            &self.diagnostics,
+                            DIAGNOSTIC_TAIL_BYTES,
+                        ));
+                    }
+                    if ui.button("Copy diagnostics").clicked() {
+                        self.diagnostics_text = sanitize_diagnostics(&recent_log_tail(
+                            &self.diagnostics,
+                            DIAGNOSTIC_TAIL_BYTES,
+                        ));
+                        self.copy_diagnostics_to_clipboard(ctx);
+                    }
+                });
+                if let Some(status) = &self.clipboard_status {
+                    match status {
+                        Ok(()) => {
+                            ui.small("Diagnostics copied to clipboard");
+                        }
+                        Err(error) => {
+                            ui.colored_label(
+                                ui.visuals().error_fg_color,
+                                format!("Could not copy diagnostics: {error}"),
+                            );
+                        }
+                    }
+                }
+
+                if !self.diagnostics_text.is_empty() {
+                    egui::ScrollArea::vertical()
+                        .max_height(180.0)
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::TextEdit::multiline(&mut self.diagnostics_text)
+                                    .font(egui::TextStyle::Monospace)
+                                    .desired_width(f32::INFINITY)
+                                    .interactive(false),
+                            );
+                        });
                 }
             });
-            if let Some(status) = &self.clipboard_status {
-                match status {
-                    Ok(()) => {
-                        ui.small("Diagnostics copied to clipboard");
-                    }
-                    Err(error) => {
-                        ui.colored_label(
-                            ui.visuals().error_fg_color,
-                            format!("Could not copy diagnostics: {error}"),
-                        );
-                    }
-                }
-            }
-
-            if !self.diagnostics_text.is_empty() {
-                egui::ScrollArea::vertical()
-                    .max_height(180.0)
-                    .show(ui, |ui| {
-                        ui.add(
-                            egui::TextEdit::multiline(&mut self.diagnostics_text)
-                                .font(egui::TextStyle::Monospace)
-                                .desired_width(f32::INFINITY)
-                                .interactive(false),
-                        );
-                    });
-            }
         });
     }
 
     fn render_fritz_status_diagnostic(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.label("FRITZ!Box host status");
-        let checking_status = self.status_check_rx.is_some();
         if ui
             .add_enabled(
-                !self.busy && !checking_status && self.ping_check_rx.is_none(),
-                egui::Button::new("Check PC via FRITZ!Box API"),
+                self.diagnostic_action_enabled(),
+                egui::Button::new(self.host_status_button_label()),
             )
             .clicked()
         {
             self.begin_host_status_check(ctx);
         }
-        if checking_status {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label("Checking FRITZ!Box…");
-            });
-        } else if let Some(result) = &self.host_status {
-            match result {
-                Ok(true) => {
-                    ui.strong("FRITZ!Box reports PC online");
-                }
-                Ok(false) => {
-                    ui.label("FRITZ!Box reports PC offline");
-                }
-                Err(error) => {
-                    ui.colored_label(
-                        ui.visuals().error_fg_color,
-                        format!("Status check failed: {error}"),
-                    );
-                }
-            }
+        if self.host_status_deadline.is_some()
+            && let Some(Err(error)) = &self.host_status
+        {
+            ui.colored_label(
+                ui.visuals().error_fg_color,
+                format!("Status check failed: {error}"),
+            );
         }
         ui.small("Queries FRITZ!Box only; does not send Wake-on-LAN.");
     }
 
     fn render_ping_diagnostic(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.label("PC ICMP reachability");
-        let checking_ping = self.ping_check_rx.is_some();
         if ui
             .add_enabled(
-                !self.busy && self.status_check_rx.is_none() && !checking_ping,
-                egui::Button::new("Ping PC through tunnel"),
+                self.diagnostic_action_enabled(),
+                egui::Button::new(self.ping_button_label()),
             )
             .clicked()
         {
             self.begin_ping_check(ctx);
         }
-        if checking_ping {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label("Resolving PC and pinging…");
-            });
-        } else if let Some(result) = &self.ping_status {
-            match result {
-                Ok(true) => {
-                    ui.strong("PC replied to ICMP ping");
-                }
-                Ok(false) => {
-                    ui.label("No ICMP reply from PC");
-                }
-                Err(error) => {
-                    ui.colored_label(ui.visuals().error_fg_color, format!("Ping failed: {error}"));
-                }
-            }
+        if self.ping_status_deadline.is_some()
+            && let Some(Err(error)) = &self.ping_status
+        {
+            ui.colored_label(ui.visuals().error_fg_color, format!("Ping failed: {error}"));
         }
         ui.small(
             "Uses the FRITZ!Box API to resolve the PC from its MAC, then sends ICMP through Waker's private tunnel; does not send Wake-on-LAN.",
@@ -668,8 +711,7 @@ impl WakerApp {
             };
             let _ = write!(
                 output,
-                "Last attempt: #{} {outcome} in {}\n\n",
-                summary.id,
+                "Last wake: {outcome} in {}\n\n",
                 format_duration(summary.elapsed)
             );
         }
@@ -894,6 +936,12 @@ impl eframe::App for WakerApp {
         self.drain_host_status_update();
         self.drain_ping_update();
         let ctx = ui.ctx().clone();
+        if let Some(remaining) = self.update_terminal_state_timeout(Instant::now()) {
+            ctx.request_repaint_after(remaining);
+        }
+        if let Some(remaining) = self.update_diagnostic_result_timeouts(Instant::now()) {
+            ctx.request_repaint_after(remaining);
+        }
 
         #[cfg(target_os = "android")]
         {
@@ -934,11 +982,17 @@ impl eframe::App for WakerApp {
                     ui.vertical_centered(|ui| {
                         self.render_branding_logo(ui);
 
-                        let wake_button =
-                            egui::Button::new("Wake").min_size(egui::vec2(160.0, 52.0));
+                        let wake_label = egui::RichText::new(self.wake_button_label())
+                            .size(22.0)
+                            .strong()
+                            .color(egui::Color32::from_rgb(32, 24, 16));
+                        let wake_button = egui::Button::new(wake_label)
+                            .fill(egui::Color32::from_rgb(248, 160, 56))
+                            .min_size(egui::vec2(160.0, 52.0));
                         if ui
                             .add_enabled(
                                 !self.busy
+                                    && !matches!(self.state, WakeState::Awake)
                                     && self.status_check_rx.is_none()
                                     && self.ping_check_rx.is_none(),
                                 wake_button,
@@ -948,23 +1002,28 @@ impl eframe::App for WakerApp {
                             self.begin_wake(&ctx);
                         }
 
-                        ui.add_space(6.0);
-                        self.render_status(ui);
+                        if matches!(self.state, WakeState::Failed(_)) {
+                            ui.add_space(6.0);
+                            self.render_wake_error(ui);
+                        }
                     });
 
                     ui.add_space(16.0);
                     ui.separator();
-                    ui.collapsing("Development settings", |ui| {
-                        ui.label("WireGuard profile");
-                        ui.text_edit_singleline(&mut self.config_path);
+                    ui.scope(|ui| {
+                        ui.visuals_mut().collapsing_header_frame = true;
+                        ui.collapsing("Settings", |ui| {
+                            ui.label("WireGuard profile");
+                            ui.text_edit_singleline(&mut self.config_path);
 
-                        ui.horizontal(|ui| {
-                            ui.label("FRITZ!Box");
-                            ui.text_edit_singleline(&mut self.fritz_ip);
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("PC MAC");
-                            ui.text_edit_singleline(&mut self.pc_mac);
+                            ui.horizontal(|ui| {
+                                ui.label("FRITZ!Box");
+                                ui.text_edit_singleline(&mut self.fritz_ip);
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("PC MAC");
+                                ui.text_edit_singleline(&mut self.pc_mac);
+                            });
                         });
                     });
                     ui.separator();
@@ -1405,6 +1464,121 @@ mod tests {
     }
 
     #[test]
+    fn wake_button_contains_the_primary_status() {
+        let mut app = WakerApp::default();
+        assert_eq!(app.wake_button_label(), "Wake");
+
+        app.state = WakeState::Connecting;
+        assert_eq!(app.wake_button_label(), "Connecting…");
+
+        app.state = WakeState::ResolvingPc;
+        assert_eq!(app.wake_button_label(), "Finding PC…");
+
+        app.state = WakeState::Waking;
+        assert_eq!(app.wake_button_label(), "Sending wake request…");
+
+        app.state = WakeState::WaitingForPc { attempt: 42 };
+        assert_eq!(app.wake_button_label(), "Waiting for PC…");
+
+        app.state = WakeState::Awake;
+        assert_eq!(app.wake_button_label(), "PC awake");
+
+        app.state = WakeState::Failed(WakeFailure::new(WakeFailureStage::Timeout, "test failure"));
+        assert_eq!(app.wake_button_label(), "Wake");
+    }
+
+    #[test]
+    fn diagnostic_results_are_repeatable_and_expire_visually() {
+        let now = Instant::now();
+        let mut app = WakerApp {
+            host_status: Some(Ok(true)),
+            host_status_deadline: Some(now + TERMINAL_STATE_DISPLAY_DURATION),
+            ping_status: Some(Ok(false)),
+            ping_status_deadline: Some(now + TERMINAL_STATE_DISPLAY_DURATION),
+            ..WakerApp::default()
+        };
+
+        assert_eq!(app.host_status_button_label(), "PC online");
+        assert_eq!(app.ping_button_label(), "No ICMP reply");
+        assert!(app.diagnostic_action_enabled());
+        assert_eq!(
+            app.update_diagnostic_result_timeouts(now),
+            Some(TERMINAL_STATE_DISPLAY_DURATION)
+        );
+
+        assert_eq!(
+            app.update_diagnostic_result_timeouts(now + TERMINAL_STATE_DISPLAY_DURATION),
+            None
+        );
+        assert_eq!(app.host_status_button_label(), "Check PC via FRITZ!Box API");
+        assert_eq!(app.ping_button_label(), "Ping PC through tunnel");
+        assert!(app.host_status.is_some());
+        assert!(app.ping_status.is_some());
+    }
+
+    #[test]
+    fn diagnostic_failures_keep_the_action_label() {
+        let now = Instant::now();
+        let app = WakerApp {
+            host_status: Some(Err("test failure".to_owned())),
+            host_status_deadline: Some(now + TERMINAL_STATE_DISPLAY_DURATION),
+            ping_status: Some(Err("test failure".to_owned())),
+            ping_status_deadline: Some(now + TERMINAL_STATE_DISPLAY_DURATION),
+            ..WakerApp::default()
+        };
+
+        assert_eq!(app.host_status_button_label(), "Check PC via FRITZ!Box API");
+        assert_eq!(app.ping_button_label(), "Ping PC through tunnel");
+        assert!(app.diagnostic_action_enabled());
+    }
+
+    #[test]
+    fn terminal_wake_states_expire_after_five_seconds() {
+        let now = Instant::now();
+
+        for state in [
+            WakeState::Awake,
+            WakeState::Failed(WakeFailure::new(WakeFailureStage::Timeout, "test failure")),
+        ] {
+            let mut app = WakerApp {
+                state,
+                terminal_state_deadline: Some(now + TERMINAL_STATE_DISPLAY_DURATION),
+                ..WakerApp::default()
+            };
+
+            assert_eq!(
+                app.update_terminal_state_timeout(now),
+                Some(TERMINAL_STATE_DISPLAY_DURATION)
+            );
+            assert!(!matches!(app.state, WakeState::Idle));
+
+            assert_eq!(
+                app.update_terminal_state_timeout(now + TERMINAL_STATE_DISPLAY_DURATION),
+                None
+            );
+            assert!(matches!(app.state, WakeState::Idle));
+            assert!(app.terminal_state_deadline.is_none());
+        }
+    }
+
+    #[test]
+    fn finishing_wake_attempt_schedules_terminal_state_reset() {
+        let mut app = WakerApp {
+            state: WakeState::Awake,
+            active_attempt: Some(ActiveAttempt {
+                id: 42,
+                started: Instant::now(),
+            }),
+            ..WakerApp::default()
+        };
+
+        app.finish_attempt();
+
+        assert!(app.last_attempt.is_some());
+        assert!(app.terminal_state_deadline.is_some());
+    }
+
+    #[test]
     fn disconnected_worker_becomes_runtime_failure() {
         let mut app = WakerApp::default();
         let (sender, receiver) = mpsc::channel();
@@ -1427,10 +1601,8 @@ mod tests {
                 ..
             })
         ));
-        assert_eq!(
-            app.last_attempt.as_ref().map(|summary| summary.id),
-            Some(42)
-        );
+        assert!(app.last_attempt.is_some());
+        assert!(app.active_attempt.is_none());
     }
 
     #[test]
