@@ -43,6 +43,9 @@ icon = "@mipmap/ic_launcher"
 [[package.metadata.android.application.activity]]
 name = "android.app.NativeActivity"
 exported = true
+# winit 0.30 cannot safely recreate its NativeActivity event loop; handle
+# target-SDK-known configuration changes in place instead of relaunching.
+config_changes = "allKnown"
 
 [[package.metadata.android.application.activity.meta_data]]
 name = "android.app.lib_name"
