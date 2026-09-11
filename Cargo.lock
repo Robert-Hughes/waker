@@ -3263,7 +3263,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "waker-app"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "eframe",
  "image",
@@ -3280,7 +3280,7 @@ dependencies = [
 
 [[package]]
 name = "waker-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "serde",
@@ -3291,7 +3291,7 @@ dependencies = [
 
 [[package]]
 name = "waker-lab"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "tokio",
  "tracing",
@@ -3300,7 +3300,7 @@ dependencies = [
 
 [[package]]
 name = "waker-net"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "base64",

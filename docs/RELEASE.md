@@ -33,6 +33,7 @@ target/release/apk/waker_app.apk
 ```
 
 The build helper sources the ignored signing environment and invokes the native FreeBSD Android build wrapper with `--release`.
+cargo-apk2 derives Android `versionCode` from the Cargo package version. **Bump `[workspace.package].version` for every APK intended to update an installed build**; otherwise some Android package installers may reject the sideload as not being a newer version.
 
 ## First migration from a debug build
 
