@@ -104,6 +104,7 @@ cargo run -p waker-lab
 The Android application is pure Rust. `waker-app` builds as a `cdylib`, uses winit's `NativeActivity` backend through eframe, and requests only normal internet access. It does **not** request Android VPN permission.
 
 The Cargo manifest uses display name **Waker** and package name `app.waker.android`. Android packaging requires a Rust Android toolchain and an APK packager compatible with the manifest metadata in `crates/waker-app/Cargo.toml`; host-specific SDK/NDK setup is intentionally kept outside this repository.
+Release signing, the local ignored keystore, the repeatable release-build command, and the one-time debug-to-release migration are documented in [`docs/RELEASE.md`](docs/RELEASE.md).
 
 Android debug builds, NativeActivity launch, diagnostics, S3 wake, and a mobile-data wake from outside the home LAN have all been exercised during development. Production wake readiness resolves the target's current IPv4 address from the FRITZ!Box Hosts service and polls ICMP through Waker's private userspace tunnel; this was selected after repeated S3 timing tests against both the former TCP probe and FRITZ!Box `NewActive`.
 

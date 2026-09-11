@@ -5,4 +5,5 @@
 /config.local.toml
 /waker.local.conf
 /.lab
+/.signing/
 .DS_Store
