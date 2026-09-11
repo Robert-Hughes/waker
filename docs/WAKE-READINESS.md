@@ -85,9 +85,9 @@ It did not establish how soon ICMP becomes usable after an S3 wake. That timing 
 
 ## Experiment 4: Wake + ICMP timing
 
-A diagnostic alternative wake action, **Wake + time ICMP**, exists specifically to measure the missing S3 behaviour without changing the production Wake button.
+A temporary diagnostic alternative wake action, **Wake + time ICMP**, was added specifically to measure the missing S3 behaviour without changing the production Wake button.
 
-Its sequence is:
+Its sequence was:
 
 1. connect one private WireGuard tunnel;
 2. resolve the target IPv4 address once from the FRITZ!Box host entry;
@@ -98,9 +98,9 @@ Its sequence is:
 7. fail after 45 seconds if no reply arrives;
 8. disconnect the tunnel.
 
-Each ICMP attempt has a 750 ms timeout followed by a 250 ms interval, giving approximately one-second sampling while the machine is unavailable.
+Each ICMP attempt used a 750 ms timeout followed by a 250 ms interval, giving approximately one-second sampling while the machine was unavailable.
 
-This experiment deliberately does **not** use the configured TCP probe address, does not change the normal Wake state machine, and does not repeatedly query the FRITZ!Box between pings.
+The experiment deliberately did **not** use the configured TCP probe address, did not alter the production Wake state machine, and did not repeatedly query the FRITZ!Box between pings.
 
 ### S3 results
 
@@ -118,11 +118,11 @@ Across the three trials, WOL-to-ICMP time ranged from **9.037 to 11.058 seconds*
 
 For comparison, the earlier temporary TCP readiness test succeeded about **9.97 seconds after WOL acceptance**, while FRITZ!Box `NewActive=1` appeared about **19.71 seconds after WOL acceptance** in the measured cycle.
 
-### Decision
+### Decision and production implementation
 
-The experiment satisfies the decision criterion: ICMP readiness is reliable across repeated S3 wakes and is effectively as prompt as the temporary TCP listener, while avoiding the dedicated target service, configured probe port, and firewall exception.
+The experiment satisfied the decision criterion: ICMP readiness was reliable across repeated S3 wakes and effectively as prompt as the temporary TCP listener, while avoiding the dedicated target service, configured probe port, and firewall exception.
 
-The intended production design is therefore:
+Production Wake now uses:
 
 ```text
 connect private WireGuard
@@ -140,12 +140,31 @@ first echo reply = awake
 disconnect
 ```
 
-The next production cleanup should remove the dedicated PC listener, firewall exception, `WakerProbeAddress` / `WAKER_PC_PROBE` configuration, PC-probe UI field, and TCP-specific wake-readiness path. The generic TCP support remains required for FRITZ!Box TR-064 HTTP.
+The production probe uses the same 750 ms ICMP timeout and 250 ms retry interval validated by the experiment. The temporary **Wake + time ICMP** action was then removed because it duplicated the production path.
 
-The temporary listener and firewall rule were runtime-only and were absent after the subsequent reboot.
+The obsolete `WakerProbeAddress` / `WAKER_PC_PROBE` configuration, PC-probe UI field, fake lab TCP listener, and TCP-specific wake-readiness code were removed. Generic TCP remains part of the private stack because FRITZ!Box TR-064 uses HTTP over TCP.
 
-## Why the experiments are staged
+The temporary target listener and firewall rule were runtime-only and were already absent after the subsequent reboot.
 
-Changing production readiness before measuring the replacement would conflate two questions: whether ICMP works at all, and whether it becomes available early enough during resume. Keeping the existing Wake button unchanged provides a known baseline while the diagnostic path gathers evidence.
+## Production acceptance
 
-Once the evidence supports a final choice, the obsolete alternatives and temporary test configuration should be removed together rather than leaving multiple production readiness mechanisms behind.
+The migrated normal **Wake** button was then tested from real S3 sleep on 11 September 2026 with the old TCP listener and firewall rule absent.
+
+The production attempt:
+
+- resolved the target through `GetSpecificHostEntry`;
+- received HTTP 200 for the FRITZ!Box WOL request;
+- required 11 ICMP readiness attempts;
+- received the first ICMP reply **10.689 seconds after WOL acceptance**;
+- completed the whole Waker attempt in **11.000 seconds**;
+- disconnected the private WireGuard tunnel normally.
+
+The host recorded a magic-packet wake, resumed roughly four seconds after WOL acceptance, brought Ethernet link up about three seconds later, and replied to ICMP about 3.6 seconds after link-up. The ICMP reply again preceded the later DHCP address-refresh log.
+
+This accepts the FRITZ host lookup + ICMP design as the production wake-readiness mechanism.
+
+## Why the experiments were staged
+
+Changing production readiness before measuring the replacement would have conflated two questions: whether ICMP worked at all, and whether it became available early enough during resume. Keeping the existing Wake button unchanged provided a known baseline while the diagnostic path gathered evidence.
+
+After the repeated S3 results met the decision criterion, the production path was migrated and the obsolete alternatives were removed together.

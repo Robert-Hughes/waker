@@ -3,9 +3,8 @@ mod diagnostics;
 use std::{
     fmt::Write as _,
     fs,
-    net::{Ipv4Addr, SocketAddrV4},
+    net::Ipv4Addr,
     path::PathBuf,
-    str::FromStr,
     sync::{
         atomic::{AtomicU64, Ordering},
         mpsc::{self, Receiver, TryRecvError},
@@ -25,9 +24,6 @@ pub use diagnostics::DiagnosticsRuntime;
 
 const APP_NAME: &str = "Waker";
 const DIAGNOSTIC_TAIL_BYTES: usize = 64 * 1024;
-const DIAGNOSTIC_WAKE_TIMEOUT: Duration = Duration::from_secs(45);
-const DIAGNOSTIC_PING_TIMEOUT: Duration = Duration::from_millis(750);
-const DIAGNOSTIC_PING_INTERVAL: Duration = Duration::from_millis(250);
 static LAST_ATTEMPT_ID: AtomicU64 = AtomicU64::new(0);
 
 struct ActiveAttempt {
@@ -42,24 +38,16 @@ struct AttemptSummary {
     failure: Option<WakeFailure>,
 }
 
-#[derive(Clone, Copy)]
-struct WakePingTiming {
-    after_wol: Duration,
-    attempts: u32,
-}
-
 #[derive(Default)]
 struct WakerFileSettings {
     fritz_ip: Option<String>,
     pc_mac: Option<String>,
-    probe_address: Option<String>,
 }
 
 pub struct WakerApp {
     config_path: String,
     fritz_ip: String,
     pc_mac: String,
-    probe_address: String,
     state: WakeState,
     state_rx: Option<Receiver<WakeState>>,
     busy: bool,
@@ -69,8 +57,6 @@ pub struct WakerApp {
     host_status: Option<Result<bool, String>>,
     ping_check_rx: Option<Receiver<Result<bool, String>>>,
     ping_status: Option<Result<bool, String>>,
-    wake_ping_rx: Option<Receiver<Result<WakePingTiming, String>>>,
-    wake_ping_result: Option<Result<WakePingTiming, String>>,
     diagnostics: DiagnosticsInfo,
     diagnostics_text: String,
 }
@@ -89,11 +75,7 @@ impl WakerApp {
                 .to_string_lossy()
                 .into_owned()
         });
-        let WakerFileSettings {
-            fritz_ip,
-            pc_mac,
-            probe_address,
-        } = load_waker_file_settings(&config_path);
+        let WakerFileSettings { fritz_ip, pc_mac } = load_waker_file_settings(&config_path);
         Self {
             config_path,
             fritz_ip: std::env::var("WAKER_FRITZ_IP")
@@ -104,10 +86,6 @@ impl WakerApp {
                 .ok()
                 .or(pc_mac)
                 .unwrap_or_default(),
-            probe_address: std::env::var("WAKER_PC_PROBE")
-                .ok()
-                .or(probe_address)
-                .unwrap_or_default(),
             state: WakeState::Idle,
             state_rx: None,
             busy: false,
@@ -117,8 +95,6 @@ impl WakerApp {
             host_status: None,
             ping_check_rx: None,
             ping_status: None,
-            wake_ping_rx: None,
-            wake_ping_result: None,
             diagnostics,
             diagnostics_text: String::new(),
         }
@@ -141,7 +117,6 @@ impl WakerApp {
                     allowed_routes = job.fritz.profile.allowed_ips.len(),
                     has_preshared_key = job.fritz.profile.has_preshared_key(),
                     fritz_ip = %job.fritz.fritz_ip,
-                    probe_address = %job.target.probe_address,
                     "wake configuration validated"
                 );
 
@@ -183,11 +158,7 @@ impl WakerApp {
     }
 
     fn begin_host_status_check(&mut self, ctx: &egui::Context) {
-        if self.busy
-            || self.status_check_rx.is_some()
-            || self.ping_check_rx.is_some()
-            || self.wake_ping_rx.is_some()
-        {
+        if self.busy || self.status_check_rx.is_some() || self.ping_check_rx.is_some() {
             return;
         }
         info!("FRITZ!Box host status check requested");
@@ -221,11 +192,7 @@ impl WakerApp {
     }
 
     fn begin_ping_check(&mut self, ctx: &egui::Context) {
-        if self.busy
-            || self.status_check_rx.is_some()
-            || self.ping_check_rx.is_some()
-            || self.wake_ping_rx.is_some()
-        {
+        if self.busy || self.status_check_rx.is_some() || self.ping_check_rx.is_some() {
             return;
         }
         info!("PC ICMP ping requested");
@@ -245,35 +212,6 @@ impl WakerApp {
             Err(message) => {
                 error!(detail = %message, "PC ICMP ping rejected");
                 self.ping_status = Some(Err(message));
-            }
-        }
-    }
-
-    fn begin_wake_ping_test(&mut self, ctx: &egui::Context) {
-        if self.busy
-            || self.status_check_rx.is_some()
-            || self.ping_check_rx.is_some()
-            || self.wake_ping_rx.is_some()
-        {
-            return;
-        }
-        info!("diagnostic Wake + ICMP timing requested");
-
-        match self.build_fritz_job() {
-            Ok(job) => {
-                let (result_tx, result_rx) = mpsc::channel();
-                self.wake_ping_rx = Some(result_rx);
-                self.wake_ping_result = None;
-                if let Err(error) = spawn_wake_ping_worker(job, result_tx, ctx.clone()) {
-                    error!(%error, "diagnostic Wake + ICMP timing failed before worker start");
-                    self.wake_ping_rx = None;
-                    self.wake_ping_result =
-                        Some(Err(format!("Could not create worker thread: {error}")));
-                }
-            }
-            Err(message) => {
-                error!(detail = %message, "diagnostic Wake + ICMP timing rejected");
-                self.wake_ping_result = Some(Err(message));
             }
         }
     }
@@ -307,8 +245,7 @@ impl WakerApp {
 
     fn build_job(&self) -> Result<WakeJob, String> {
         let fritz = self.build_fritz_job()?;
-        let probe_address = parse_probe_address(&self.probe_address)?;
-        let target = WakeTarget::new(fritz.mac, probe_address);
+        let target = WakeTarget::new(fritz.mac);
         Ok(WakeJob { fritz, target })
     }
 
@@ -387,25 +324,6 @@ impl WakerApp {
         if let Some(result) = update {
             self.ping_status = Some(result);
             self.ping_check_rx = None;
-        }
-    }
-
-    fn drain_wake_ping_update(&mut self) {
-        let Some(receiver) = self.wake_ping_rx.as_ref() else {
-            return;
-        };
-
-        let update = match receiver.try_recv() {
-            Ok(result) => Some(result),
-            Err(TryRecvError::Empty) => None,
-            Err(TryRecvError::Disconnected) => Some(Err(
-                "Wake + ICMP timing worker stopped without reporting a result".to_owned(),
-            )),
-        };
-
-        if let Some(result) = update {
-            self.wake_ping_result = Some(result);
-            self.wake_ping_rx = None;
         }
     }
 
@@ -500,8 +418,6 @@ impl WakerApp {
             ui.separator();
             self.render_ping_diagnostic(ui, ctx);
             ui.separator();
-            self.render_wake_ping_diagnostic(ui, ctx);
-            ui.separator();
 
             ui.horizontal(|ui| {
                 if ui.button("Refresh log").clicked() {
@@ -539,10 +455,7 @@ impl WakerApp {
         let checking_status = self.status_check_rx.is_some();
         if ui
             .add_enabled(
-                !self.busy
-                    && !checking_status
-                    && self.ping_check_rx.is_none()
-                    && self.wake_ping_rx.is_none(),
+                !self.busy && !checking_status && self.ping_check_rx.is_none(),
                 egui::Button::new("Check PC via FRITZ!Box API"),
             )
             .clicked()
@@ -578,10 +491,7 @@ impl WakerApp {
         let checking_ping = self.ping_check_rx.is_some();
         if ui
             .add_enabled(
-                !self.busy
-                    && self.status_check_rx.is_none()
-                    && !checking_ping
-                    && self.wake_ping_rx.is_none(),
+                !self.busy && self.status_check_rx.is_none() && !checking_ping,
                 egui::Button::new("Ping PC through tunnel"),
             )
             .clicked()
@@ -608,50 +518,6 @@ impl WakerApp {
         }
         ui.small(
             "Uses the FRITZ!Box API to resolve the PC from its MAC, then sends ICMP through Waker's private tunnel; does not send Wake-on-LAN.",
-        );
-    }
-
-    fn render_wake_ping_diagnostic(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.label("Wake readiness experiment");
-        let running = self.wake_ping_rx.is_some();
-        if ui
-            .add_enabled(
-                !self.busy
-                    && self.status_check_rx.is_none()
-                    && self.ping_check_rx.is_none()
-                    && !running,
-                egui::Button::new("Wake + time ICMP"),
-            )
-            .clicked()
-        {
-            self.begin_wake_ping_test(ctx);
-        }
-
-        if running {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label("Sending WOL and waiting for first ICMP reply…");
-            });
-        } else if let Some(result) = &self.wake_ping_result {
-            match result {
-                Ok(timing) => {
-                    ui.strong(format!(
-                        "ICMP replied {} after WOL ({} attempts)",
-                        format_duration(timing.after_wol),
-                        timing.attempts
-                    ));
-                }
-                Err(error) => {
-                    ui.colored_label(
-                        ui.visuals().error_fg_color,
-                        format!("Wake + ICMP test failed: {error}"),
-                    );
-                }
-            }
-        }
-
-        ui.small(
-            "Diagnostic alternative wake: resolves the PC once through the FRITZ!Box API, sends WOL, then polls ICMP through the same private tunnel. Production Wake is unchanged.",
         );
     }
 
@@ -689,21 +555,6 @@ impl WakerApp {
             };
             let _ = write!(output, "PC ICMP ping: {status}\n\n");
         }
-        if let Some(result) = &self.wake_ping_result {
-            match result {
-                Ok(timing) => {
-                    let _ = write!(
-                        output,
-                        "Wake + ICMP timing: {} after WOL ({} attempts)\n\n",
-                        format_duration(timing.after_wol),
-                        timing.attempts
-                    );
-                }
-                Err(error) => {
-                    let _ = write!(output, "Wake + ICMP timing: failed - {error}\n\n");
-                }
-            }
-        }
         output.push_str(&self.diagnostics_text);
         sanitize_diagnostics(&output)
     }
@@ -714,7 +565,6 @@ impl eframe::App for WakerApp {
         self.drain_state_updates();
         self.drain_host_status_update();
         self.drain_ping_update();
-        self.drain_wake_ping_update();
         let ctx = ui.ctx().clone();
 
         egui::CentralPanel::default().show(ui, |ui| {
@@ -728,8 +578,7 @@ impl eframe::App for WakerApp {
                         .add_enabled(
                             !self.busy
                                 && self.status_check_rx.is_none()
-                                && self.ping_check_rx.is_none()
-                                && self.wake_ping_rx.is_none(),
+                                && self.ping_check_rx.is_none(),
                             wake_button,
                         )
                         .clicked()
@@ -755,11 +604,6 @@ impl eframe::App for WakerApp {
                         ui.label("PC MAC");
                         ui.text_edit_singleline(&mut self.pc_mac);
                     });
-                    ui.horizontal(|ui| {
-                        ui.label("PC probe");
-                        ui.text_edit_singleline(&mut self.probe_address);
-                    });
-                    ui.small("Probe format: IPv4:port, for example 192.0.2.42:22");
                 });
                 ui.separator();
                 self.render_diagnostics(ui, &ctx);
@@ -957,94 +801,11 @@ fn spawn_ping_worker(
         .map(|_| ())
 }
 
-fn spawn_wake_ping_worker(
-    job: FritzJob,
-    result_tx: mpsc::Sender<Result<WakePingTiming, String>>,
-    repaint: egui::Context,
-) -> std::io::Result<()> {
-    std::thread::Builder::new()
-        .name("waker-wake-ping-worker".to_owned())
-        .spawn(move || {
-            let runtime = match network_runtime() {
-                Ok(runtime) => runtime,
-                Err(error) => {
-                    let message = format!("could not start networking runtime: {error}");
-                    error!(detail = %message, "diagnostic Wake + ICMP timing failed");
-                    let _ = result_tx.send(Err(message));
-                    repaint.request_repaint();
-                    return;
-                }
-            };
-
-            let span = info_span!("wake_icmp_timing");
-            runtime.block_on(
-                async move {
-                    let started = Instant::now();
-                    let mut backend = WakerWireGuardBackend::new(job.profile, job.fritz_ip);
-                    let result = async {
-                        backend.connect().await.map_err(|error| error.to_string())?;
-                        let target = backend
-                            .host_ipv4(job.mac)
-                            .await
-                            .map_err(|error| error.to_string())?;
-                        backend
-                            .send_wake(job.mac)
-                            .await
-                            .map_err(|error| error.to_string())?;
-
-                        let wol_accepted = Instant::now();
-                        info!("diagnostic Wake-on-LAN request accepted; starting ICMP polling");
-                        let mut attempts = 0_u32;
-                        loop {
-                            attempts = attempts.saturating_add(1);
-                            let reachable = backend
-                                .ping_ipv4(target, DIAGNOSTIC_PING_TIMEOUT)
-                                .await
-                                .map_err(|error| error.to_string())?;
-                            if reachable {
-                                return Ok(WakePingTiming {
-                                    after_wol: wol_accepted.elapsed(),
-                                    attempts,
-                                });
-                            }
-                            if wol_accepted.elapsed() >= DIAGNOSTIC_WAKE_TIMEOUT {
-                                return Err(format!(
-                                    "no ICMP reply within {} seconds after WOL",
-                                    DIAGNOSTIC_WAKE_TIMEOUT.as_secs()
-                                ));
-                            }
-                            tokio::time::sleep(DIAGNOSTIC_PING_INTERVAL).await;
-                        }
-                    }
-                    .await;
-                    backend.disconnect().await;
-
-                    match &result {
-                        Ok(timing) => info!(
-                            after_wol_ms = timing.after_wol.as_millis(),
-                            attempts = timing.attempts,
-                            elapsed_ms = started.elapsed().as_millis(),
-                            "diagnostic Wake + ICMP timing completed"
-                        ),
-                        Err(message) => error!(
-                            detail = %message,
-                            elapsed_ms = started.elapsed().as_millis(),
-                            "diagnostic Wake + ICMP timing failed"
-                        ),
-                    }
-                    let _ = result_tx.send(result);
-                    repaint.request_repaint();
-                }
-                .instrument(span),
-            );
-        })
-        .map(|_| ())
-}
-
 fn log_state(attempt_id: u64, state: &WakeState) {
     match state {
         WakeState::Idle => info!(attempt_id, stage = "idle", "wake state changed"),
         WakeState::Connecting => info!(attempt_id, stage = "connect", "wake state changed"),
+        WakeState::ResolvingPc => info!(attempt_id, stage = "resolve_target", "wake state changed"),
         WakeState::Waking => info!(attempt_id, stage = "wake_request", "wake state changed"),
         WakeState::WaitingForPc { attempt } => info!(
             attempt_id,
@@ -1133,17 +894,10 @@ fn parse_waker_file_settings(config: &str) -> WakerFileSettings {
         match key.trim().to_ascii_lowercase().as_str() {
             "wakerfritzip" => settings.fritz_ip = Some(value.to_owned()),
             "wakerpcmac" => settings.pc_mac = Some(value.to_owned()),
-            "wakerprobeaddress" => settings.probe_address = Some(value.to_owned()),
             _ => {}
         }
     }
     settings
-}
-
-fn parse_probe_address(value: &str) -> Result<SocketAddrV4, String> {
-    let value = value.trim();
-    SocketAddrV4::from_str(value)
-        .map_err(|error| format!("invalid PC probe address {value:?}: {error}"))
 }
 
 fn expand_home(value: &str) -> PathBuf {
@@ -1249,21 +1003,14 @@ mod tests {
     }
 
     #[test]
-    fn parses_ipv4_probe_address() {
-        let address = parse_probe_address("192.0.2.42:22").unwrap();
-        assert_eq!(address.port(), 22);
-    }
-
-    #[test]
     fn parses_waker_fields_from_combined_profile() {
         let settings = parse_waker_file_settings(
             "[Interface]\nAddress = 192.0.2.2/24\nWakerFritzIP = 192.168.178.1\n\
-             WakerPcMac = AA:BB:CC:DD:EE:FF\nWakerProbeAddress = 192.0.2.42:22\n\
+             WakerPcMac = AA:BB:CC:DD:EE:FF\n\
              [Peer]\nEndpoint = example.invalid:51820\n",
         );
         assert_eq!(settings.fritz_ip.as_deref(), Some("192.168.178.1"));
         assert_eq!(settings.pc_mac.as_deref(), Some("AA:BB:CC:DD:EE:FF"));
-        assert_eq!(settings.probe_address.as_deref(), Some("192.0.2.42:22"));
     }
 
     #[test]
@@ -1337,18 +1084,5 @@ mod tests {
             app.diagnostics_bundle()
                 .contains("PC ICMP ping: reply received")
         );
-    }
-
-    #[test]
-    fn copied_diagnostics_include_wake_icmp_timing() {
-        let app = WakerApp {
-            wake_ping_result: Some(Ok(WakePingTiming {
-                after_wol: Duration::from_millis(10_250),
-                attempts: 11,
-            })),
-            ..WakerApp::default()
-        };
-        let bundle = app.diagnostics_bundle();
-        assert!(bundle.contains("Wake + ICMP timing: 10.2 s after WOL (11 attempts)"));
     }
 }

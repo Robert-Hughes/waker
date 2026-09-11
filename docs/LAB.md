@@ -2,7 +2,7 @@
 
 This lab exercises Waker's real `smoltcp -> GotaTun -> UDP -> WireGuard peer` path without contacting the production FRITZ!Box.
 
-On GhostBSD/FreeBSD the peer is the independent kernel WireGuard implementation, which is useful because it verifies interoperability rather than testing GotaTun against itself.
+On GhostBSD/FreeBSD the peer is the independent kernel WireGuard implementation, which verifies interoperability rather than testing GotaTun against itself.
 
 ## What it creates
 
@@ -19,7 +19,7 @@ lab peer       10.231.0.1
 
 It generates throwaway client/server keys and stores them below the ignored `.lab/` directory. It never reads or changes a production WireGuard profile.
 
-If IPFW is enabled, the helper also installs temporary rule `90` allowing only `10.231.0.0/24` traffic via `wg-waker-lab`; the rule is required for the synthetic inbound TCP services on GhostBSD. The helper refuses to run if rule `90` or the `wg-waker-lab` interface already exists, and teardown removes only the marked lab rule/interface.
+If IPFW is enabled, the helper installs temporary rule `90` allowing only `10.231.0.0/24` traffic via `wg-waker-lab`. This permits the synthetic FRITZ HTTP service and ICMP readiness traffic through the lab interface. The helper refuses to run if rule `90` or the `wg-waker-lab` interface already exists, and teardown removes only the marked lab rule/interface.
 
 ## Start the lab peer
 
@@ -29,9 +29,9 @@ From the repository root:
 sudo ./scripts/lab-up-freebsd.sh
 ```
 
-The command prints the generated client profile and the exact commands for the two unprivileged processes.
+The command prints the generated client profile and the exact commands for the unprivileged processes.
 
-## Start fake FRITZ and PC services
+## Start the fake FRITZ service
 
 In terminal 1:
 
@@ -43,17 +43,20 @@ cargo run -p waker-lab
 Defaults:
 
 - fake FRITZ: `0.0.0.0:49000`
-- fake PC probe: `0.0.0.0:2222`
-- fake PC wake delay: 2000 ms
+- target IPv4 returned by `GetSpecificHostEntry`: `10.231.0.1`
 
-The fake PC port is not opened until the fake FRITZ receives the WOL SOAP request. This lets the normal Waker retry state machine exercise the transition from asleep to reachable.
+The fake service implements the two Hosts actions used by the production wake flow:
 
-The values can be changed with:
+- `GetSpecificHostEntry` returns the configured lab target IPv4 address;
+- `X_AVM-DE_WakeOnLANByMACAddress` accepts the WOL request.
+
+The target is the FreeBSD WireGuard peer itself, so the production ICMP readiness probe is exercised over the real encrypted tunnel. Retry and timeout behaviour are covered separately by `waker-core` unit tests.
+
+The returned target can be changed with:
 
 ```sh
 WAKER_LAB_FRITZ_BIND=0.0.0.0:49000 \
-WAKER_LAB_PC_BIND=0.0.0.0:2222 \
-WAKER_LAB_WAKE_DELAY_MS=5000 \
+WAKER_LAB_PC_IP=10.231.0.1 \
 cargo run -p waker-lab
 ```
 
@@ -66,12 +69,17 @@ cd ~/src/waker
 WAKER_WG_CONFIG="$PWD/.lab/waker-lab.conf" \
 WAKER_FRITZ_IP="10.231.0.1" \
 WAKER_PC_MAC="AA:BB:CC:DD:EE:FF" \
-WAKER_PC_PROBE="10.231.0.1:2222" \
 RUST_LOG=waker=trace \
 cargo run -p waker-app --bin waker
 ```
 
-Press **Wake**. A successful trace should show the private TCP connection to the fake FRITZ, the WOL request, one or more failed PC probes during the artificial delay, then a successful probe.
+Press **Wake**. A successful trace should show:
+
+1. the private TCP connection to the fake FRITZ;
+2. `GetSpecificHostEntry` resolving the target IPv4 address;
+3. the WOL request;
+4. an ICMP readiness probe to the resolved lab peer;
+5. the terminal **PC awake** state.
 
 For an automated non-GUI end-to-end run against the same live lab:
 
@@ -80,7 +88,7 @@ WAKER_LAB_PROFILE="$PWD/.lab/waker-lab.conf" \
   cargo test -p waker-net --test local_lab -- --ignored --nocapture
 ```
 
-This test is ignored during normal `cargo test --workspace` runs because it requires the temporary kernel WireGuard peer and fake services.
+This test is ignored during normal `cargo test --workspace` runs because it requires the temporary kernel WireGuard peer and fake service.
 
 For packet-level diagnosis, the two useful capture points are:
 
@@ -89,7 +97,7 @@ sudo tcpdump -ni lo0 udp port 51820
 sudo tcpdump -ni wg-waker-lab
 ```
 
-`lo0` shows encrypted WireGuard traffic. `wg-waker-lab` shows the decrypted inner TCP/IP traffic.
+`lo0` shows encrypted WireGuard traffic. `wg-waker-lab` shows the decrypted inner HTTP and ICMP traffic.
 
 ## Tear down
 
@@ -104,9 +112,9 @@ The teardown helper removes only the marked lab IPFW rule (when one was installe
 It gives separate failure boundaries:
 
 - no UDP/handshake traffic: endpoint/GotaTun problem;
-- handshake but no inner SYN: GotaTun-to-smoltcp adapter problem;
-- malformed inner TCP: smoltcp configuration/problem;
+- handshake but no inner TCP: GotaTun-to-smoltcp adapter problem;
 - good TCP but wrong SOAP: FRITZ protocol problem;
-- WOL succeeds but no eventual probe: target/readiness problem.
+- host lookup does not resolve the expected address: Hosts parsing/problem;
+- WOL succeeds but no inner ICMP: readiness/ICMP path problem.
 
 The same `waker-net` code is used by this lab, the desktop application, and Android.

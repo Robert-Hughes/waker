@@ -108,7 +108,6 @@ Run Waker in another terminal:
   WAKER_WG_CONFIG="$CLIENT_CONFIG" \\
   WAKER_FRITZ_IP="10.231.0.1" \\
   WAKER_PC_MAC="AA:BB:CC:DD:EE:FF" \\
-  WAKER_PC_PROBE="10.231.0.1:2222" \\
   cargo run -p waker-app --bin waker
 
 When finished:

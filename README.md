@@ -62,18 +62,14 @@ Waker currently exposes its setup values in the collapsible **Development settin
 export WAKER_WG_CONFIG="$HOME/path/to/fritz-wireguard.conf"
 export WAKER_FRITZ_IP="192.168.178.1"
 export WAKER_PC_MAC="AA:BB:CC:DD:EE:FF"
-export WAKER_PC_PROBE="192.0.2.42:22"
 cargo run -p waker-app --bin waker
 ```
 
-The probe should be a TCP port that becomes available reliably after the PC boots, for example SSH, RDP, or another known service. It is a stronger readiness check than merely receiving ICMP.
-
-`waker.local.conf` is ignored by Git and is the default desktop profile path. Waker can keep its application settings in the same private file using the extension keys `WakerFritzIP`, `WakerPcMac`, and `WakerProbeAddress`:
+`waker.local.conf` is ignored by Git and is the default desktop profile path. Waker can keep its application settings in the same private file using the extension keys `WakerFritzIP` and `WakerPcMac`:
 
 ```ini
 WakerFritzIP = 192.168.178.1
 WakerPcMac = AA:BB:CC:DD:EE:FF
-WakerProbeAddress = 192.0.2.42:22
 ```
 
 Environment variables override these file values, and file values override built-in defaults. The WireGuard parser deliberately ignores the Waker extension keys as well as wg-quick-only fields such as `DNS`; Waker never changes system DNS or routes.
@@ -89,10 +85,10 @@ Waker
   -> encrypted UDP over 127.0.0.1
   -> FreeBSD kernel WireGuard peer
   -> fake FRITZ TCP :49000
-  -> fake PC TCP :2222
+  -> ICMP to the resolved lab peer address
 ```
 
-The fake FRITZ service accepts the same WOL SOAP action used by the real backend. After receiving it, the fake PC waits for a configurable delay before beginning to accept probe connections.
+The fake FRITZ service implements the Hosts actions Waker uses for target lookup and WOL. The FreeBSD WireGuard peer itself answers the ICMP readiness probe, while core unit tests cover retry and timeout transitions.
 
 On GhostBSD/FreeBSD, use the helper scripts described in `docs/LAB.md`. They create only an ephemeral `wg-waker-lab` interface and a generated test profile; no production keys are involved.
 
@@ -108,19 +104,19 @@ The Android application is pure Rust. `waker-app` builds as a `cdylib`, uses win
 
 The Cargo manifest uses display name **Waker** and package name `app.waker.android`. Android packaging requires a Rust Android toolchain and an APK packager compatible with the manifest metadata in `crates/waker-app/Cargo.toml`; host-specific SDK/NDK setup is intentionally kept outside this repository.
 
-Android debug builds, NativeActivity launch, diagnostics, S3 wake, and a mobile-data wake from outside the home LAN have all been exercised during development. The current wake-completion check still uses the temporary TCP readiness probe while FRITZ!Box host-status polling is evaluated.
+Android debug builds, NativeActivity launch, diagnostics, S3 wake, and a mobile-data wake from outside the home LAN have all been exercised during development. Production wake readiness resolves the target's current IPv4 address from the FRITZ!Box Hosts service and polls ICMP through Waker's private userspace tunnel; this was selected after repeated S3 timing tests against both the former TCP probe and FRITZ!Box `NewActive`.
 
 On Android, the default WireGuard profile path is `<internalDataPath>/waker.local.conf`. Development profiles should be provisioned there through app-private storage; they should not be copied to shared `/sdcard` storage.
 
 ## Diagnostics and reporting
 
-Each wake attempt has an ID and elapsed time. The normal UI presents concise progress (`Connecting`, wake request, numbered PC probes), a friendly terminal success/failure, and a collapsible technical **Details** section for failures. Unexpected worker/runtime shutdowns are converted into terminal runtime failures rather than leaving the UI permanently busy.
+Each wake attempt has an ID and elapsed time. The normal UI presents concise progress (`Connecting`, `Finding PC`, wake request, numbered readiness probes), a friendly terminal success/failure, and a collapsible technical **Details** section for failures. Unexpected worker/runtime shutdowns are converted into terminal runtime failures rather than leaving the UI permanently busy.
 
 Waker also writes a persistent diagnostic event stream. The default log level is `debug`; set `WAKER_LOG=trace` for packet-level Waker tracing, or `info`, `warn`, or `error` to reduce detail. Persistent logs contain only Waker's own tracing targets, not arbitrary dependency logs. The background writer is non-lossy: if its bounded queue is ever saturated, Waker applies backpressure rather than silently dropping diagnostic events.
 
 Desktop logs are written under `$XDG_STATE_HOME/waker/logs`, or `~/.local/state/waker/logs` when `XDG_STATE_HOME` is unset, and are mirrored to stderr. The desktop diagnostics directory is forced to mode `0700`. Android logs are written under the app-private internal data directory and mirrored to Android logcat with tag `Waker`. Logs rotate daily with at most seven files retained.
 
-The in-app **Diagnostics** panel shows the last attempt, persistent-log status, a recent log tail, and three network diagnostics: **Check PC via FRITZ!Box API**, **Ping PC through tunnel**, and **Wake + time ICMP**. The first reports `GetSpecificHostEntry`/`NewActive`; the second resolves the target IPv4 address from that same host entry and sends one ICMP echo through Waker's private userspace tunnel; the third is an experimental alternative wake path that resolves once, sends WOL, and measures the first ICMP reply without changing the production Wake button. **Copy diagnostics** includes these results and copies a sanitised bundle suitable for troubleshooting. The experiments and decision criteria are recorded in [`docs/WAKE-READINESS.md`](docs/WAKE-READINESS.md). WireGuard private keys and preshared keys are private implementation fields, never deliberately logged, and credential-assignment lines are redacted again when diagnostics are copied.
+The in-app **Diagnostics** panel shows the last attempt, persistent-log status, a recent log tail, and two network diagnostics: **Check PC via FRITZ!Box API** and **Ping PC through tunnel**. The first reports `GetSpecificHostEntry`/`NewActive`; the second resolves the target IPv4 address from that same host entry and sends one ICMP echo through Waker's private userspace tunnel. **Copy diagnostics** includes these results and copies a sanitised bundle suitable for troubleshooting. The experiments that led to the production ICMP readiness design are recorded in [`docs/WAKE-READINESS.md`](docs/WAKE-READINESS.md). WireGuard private keys and preshared keys are private implementation fields, never deliberately logged, and credential-assignment lines are redacted again when diagnostics are copied.
 
 ## Validation
 

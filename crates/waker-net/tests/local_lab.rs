@@ -1,7 +1,4 @@
-use std::{
-    net::{Ipv4Addr, SocketAddrV4},
-    str::FromStr,
-};
+use std::{net::Ipv4Addr, str::FromStr};
 
 use waker_core::{MacAddress, WakeState, WakeTarget, run_wake};
 use waker_net::{WakerWireGuardBackend, WireGuardProfile};
@@ -19,10 +16,7 @@ async fn wakes_through_real_wireguard_peer() {
     let profile = WireGuardProfile::parse(&profile_text).expect("parse lab WireGuard profile");
 
     let fritz_ip = Ipv4Addr::new(10, 231, 0, 1);
-    let target = WakeTarget::new(
-        MacAddress::from_str("AA:BB:CC:DD:EE:FF").expect("test MAC"),
-        SocketAddrV4::new(fritz_ip, 2222),
-    );
+    let target = WakeTarget::new(MacAddress::from_str("AA:BB:CC:DD:EE:FF").expect("test MAC"));
     let mut backend = WakerWireGuardBackend::new(profile, fritz_ip);
     let mut states = Vec::new();
 
@@ -34,6 +28,11 @@ async fn wakes_through_real_wireguard_peer() {
     .expect("wake through local WireGuard lab");
 
     assert!(matches!(states.first(), Some(WakeState::Connecting)));
+    assert!(
+        states
+            .iter()
+            .any(|state| matches!(state, WakeState::ResolvingPc))
+    );
     assert!(
         states
             .iter()

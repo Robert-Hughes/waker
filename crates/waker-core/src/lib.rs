@@ -1,4 +1,4 @@
-use std::{fmt, net::SocketAddrV4, str::FromStr, time::Duration};
+use std::{fmt, net::Ipv4Addr, str::FromStr, time::Duration};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -53,19 +53,17 @@ pub struct ParseMacAddressError(String);
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WakeTarget {
     pub mac: MacAddress,
-    pub probe_address: SocketAddrV4,
     pub probe_timeout: Duration,
     pub probe_interval: Duration,
 }
 
 impl WakeTarget {
     #[must_use]
-    pub fn new(mac: MacAddress, probe_address: SocketAddrV4) -> Self {
+    pub fn new(mac: MacAddress) -> Self {
         Self {
             mac,
-            probe_address,
             probe_timeout: Duration::from_mins(1),
-            probe_interval: Duration::from_secs(1),
+            probe_interval: Duration::from_millis(250),
         }
     }
 }
@@ -74,6 +72,7 @@ impl WakeTarget {
 pub enum WakeFailureStage {
     Configuration,
     Connect,
+    ResolveTarget,
     WakeRequest,
     Probe,
     Timeout,
@@ -86,6 +85,7 @@ impl WakeFailureStage {
         match self {
             Self::Configuration => "Configuration is invalid",
             Self::Connect => "Could not connect to FRITZ!Box",
+            Self::ResolveTarget => "Could not resolve the PC address",
             Self::WakeRequest => "FRITZ!Box did not accept the wake request",
             Self::Probe => "Could not check whether the PC is awake",
             Self::Timeout => "PC did not wake in time",
@@ -98,6 +98,7 @@ impl WakeFailureStage {
         match self {
             Self::Configuration => "configuration",
             Self::Connect => "connect",
+            Self::ResolveTarget => "resolve_target",
             Self::WakeRequest => "wake_request",
             Self::Probe => "probe",
             Self::Timeout => "timeout",
@@ -137,6 +138,7 @@ impl fmt::Display for WakeFailure {
 pub enum WakeState {
     Idle,
     Connecting,
+    ResolvingPc,
     Waking,
     WaitingForPc { attempt: u32 },
     Awake,
@@ -149,6 +151,7 @@ impl WakeState {
         match self {
             Self::Idle => "Ready".to_owned(),
             Self::Connecting => "Connecting…".to_owned(),
+            Self::ResolvingPc => "Finding PC…".to_owned(),
             Self::Waking => "Sending wake request…".to_owned(),
             Self::WaitingForPc { attempt } => format!("Waiting for PC… ({attempt})"),
             Self::Awake => "PC awake".to_owned(),
@@ -171,8 +174,9 @@ impl WakeBackendError {
 #[async_trait]
 pub trait WakeBackend: Send {
     async fn connect(&mut self) -> Result<(), WakeBackendError>;
+    async fn resolve_target_ipv4(&mut self, mac: MacAddress) -> Result<Ipv4Addr, WakeBackendError>;
     async fn send_wake(&mut self, mac: MacAddress) -> Result<(), WakeBackendError>;
-    async fn probe(&mut self, address: SocketAddrV4) -> Result<bool, WakeBackendError>;
+    async fn probe(&mut self, address: Ipv4Addr) -> Result<bool, WakeBackendError>;
     async fn disconnect(&mut self);
 }
 
@@ -200,6 +204,14 @@ where
             .await
             .map_err(|error| WakeFailure::new(WakeFailureStage::Connect, error.to_string()))?;
 
+        report(WakeState::ResolvingPc);
+        let address = backend
+            .resolve_target_ipv4(target.mac)
+            .await
+            .map_err(|error| {
+                WakeFailure::new(WakeFailureStage::ResolveTarget, error.to_string())
+            })?;
+
         report(WakeState::Waking);
         backend
             .send_wake(target.mac)
@@ -213,7 +225,7 @@ where
             report(WakeState::WaitingForPc { attempt });
 
             if backend
-                .probe(target.probe_address)
+                .probe(address)
                 .await
                 .map_err(|error| WakeFailure::new(WakeFailureStage::Probe, error.to_string()))?
             {
@@ -247,7 +259,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, net::Ipv4Addr};
+    use std::collections::VecDeque;
 
     use super::*;
 
@@ -262,11 +274,18 @@ mod tests {
             Ok(())
         }
 
+        async fn resolve_target_ipv4(
+            &mut self,
+            _mac: MacAddress,
+        ) -> Result<Ipv4Addr, WakeBackendError> {
+            Ok(Ipv4Addr::LOCALHOST)
+        }
+
         async fn send_wake(&mut self, _mac: MacAddress) -> Result<(), WakeBackendError> {
             Ok(())
         }
 
-        async fn probe(&mut self, _address: SocketAddrV4) -> Result<bool, WakeBackendError> {
+        async fn probe(&mut self, _address: Ipv4Addr) -> Result<bool, WakeBackendError> {
             Ok(self.probes.pop_front().unwrap_or(false))
         }
 
@@ -289,10 +308,7 @@ mod tests {
             probes: VecDeque::from([false, true]),
             disconnected: false,
         };
-        let mut target = WakeTarget::new(
-            "AA:BB:CC:DD:EE:FF".parse().unwrap(),
-            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 22),
-        );
+        let mut target = WakeTarget::new("AA:BB:CC:DD:EE:FF".parse().unwrap());
         target.probe_interval = Duration::ZERO;
 
         let mut states = Vec::new();
@@ -302,7 +318,66 @@ mod tests {
 
         assert!(backend.disconnected);
         assert_eq!(states.first(), Some(&WakeState::Connecting));
+        assert!(states.contains(&WakeState::ResolvingPc));
         assert_eq!(states.last(), Some(&WakeState::Awake));
+    }
+
+    #[tokio::test]
+    async fn target_resolution_failure_stops_before_wol() {
+        struct ResolveFailBackend {
+            disconnected: bool,
+            wake_sent: bool,
+        }
+
+        #[async_trait]
+        impl WakeBackend for ResolveFailBackend {
+            async fn connect(&mut self) -> Result<(), WakeBackendError> {
+                Ok(())
+            }
+
+            async fn resolve_target_ipv4(
+                &mut self,
+                _mac: MacAddress,
+            ) -> Result<Ipv4Addr, WakeBackendError> {
+                Err(WakeBackendError::new("host lookup failed"))
+            }
+
+            async fn send_wake(&mut self, _mac: MacAddress) -> Result<(), WakeBackendError> {
+                self.wake_sent = true;
+                Ok(())
+            }
+
+            async fn probe(&mut self, _address: Ipv4Addr) -> Result<bool, WakeBackendError> {
+                Ok(false)
+            }
+
+            async fn disconnect(&mut self) {
+                self.disconnected = true;
+            }
+        }
+
+        let mut backend = ResolveFailBackend {
+            disconnected: false,
+            wake_sent: false,
+        };
+        let target = WakeTarget::new("AA:BB:CC:DD:EE:FF".parse().unwrap());
+        let mut states = Vec::new();
+
+        let failure = run_wake(&mut backend, &target, |state| states.push(state))
+            .await
+            .unwrap_err();
+
+        assert!(backend.disconnected);
+        assert!(!backend.wake_sent);
+        assert_eq!(failure.stage, WakeFailureStage::ResolveTarget);
+        assert!(states.contains(&WakeState::ResolvingPc));
+        assert!(matches!(
+            states.last(),
+            Some(WakeState::Failed(WakeFailure {
+                stage: WakeFailureStage::ResolveTarget,
+                ..
+            }))
+        ));
     }
 
     #[tokio::test]
@@ -311,10 +386,7 @@ mod tests {
             probes: VecDeque::from([false]),
             disconnected: false,
         };
-        let mut target = WakeTarget::new(
-            "AA:BB:CC:DD:EE:FF".parse().unwrap(),
-            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 22),
-        );
+        let mut target = WakeTarget::new("AA:BB:CC:DD:EE:FF".parse().unwrap());
         target.probe_interval = Duration::ZERO;
         target.probe_timeout = Duration::ZERO;
 

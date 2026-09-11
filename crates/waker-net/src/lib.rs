@@ -1039,6 +1039,12 @@ impl WakeBackend for WakerWireGuardBackend {
         Ok(())
     }
 
+    async fn resolve_target_ipv4(&mut self, mac: MacAddress) -> Result<Ipv4Addr, WakeBackendError> {
+        let address = self.host_ipv4(mac).await?;
+        debug!(%mac, %address, "FRITZ!Box target IPv4 resolved");
+        Ok(address)
+    }
+
     async fn send_wake(&mut self, mac: MacAddress) -> Result<(), WakeBackendError> {
         let arguments = format!("<NewMACAddress>{mac}</NewMACAddress>");
         let (status, _response) = self
@@ -1048,13 +1054,9 @@ impl WakeBackend for WakerWireGuardBackend {
         Ok(())
     }
 
-    async fn probe(&mut self, address: SocketAddrV4) -> Result<bool, WakeBackendError> {
-        let reachable = self
-            .tunnel()?
-            .probe(address, Duration::from_secs(2))
-            .await
-            .map_err(to_backend_error)?;
-        debug!(target = %address, reachable, "PC reachability probe completed");
+    async fn probe(&mut self, address: Ipv4Addr) -> Result<bool, WakeBackendError> {
+        let reachable = self.ping_ipv4(address, Duration::from_millis(750)).await?;
+        debug!(target = %address, reachable, "PC ICMP readiness probe completed");
         Ok(reachable)
     }
 

@@ -1,9 +1,11 @@
-use std::{net::SocketAddr, time::Duration};
+use std::{
+    net::{IpAddr, SocketAddr},
+    str::FromStr as _,
+};
 
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
     net::TcpListener,
-    sync::watch,
 };
 use tracing::{info, warn};
 
@@ -20,31 +22,16 @@ async fn main() -> std::io::Result<()> {
         .unwrap_or_else(|_| "0.0.0.0:49000".to_owned())
         .parse()
         .expect("valid WAKER_LAB_FRITZ_BIND");
-    let pc_bind: SocketAddr = std::env::var("WAKER_LAB_PC_BIND")
-        .unwrap_or_else(|_| "0.0.0.0:2222".to_owned())
-        .parse()
-        .expect("valid WAKER_LAB_PC_BIND");
-    let wake_delay = Duration::from_millis(
-        std::env::var("WAKER_LAB_WAKE_DELAY_MS")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(2_000),
-    );
+    let pc_ip = IpAddr::from_str(
+        &std::env::var("WAKER_LAB_PC_IP").unwrap_or_else(|_| "10.231.0.1".to_owned()),
+    )
+    .expect("valid WAKER_LAB_PC_IP");
 
-    let (awake_tx, awake_rx) = watch::channel(false);
-    let fritz = run_fake_fritz(fritz_bind, awake_tx, wake_delay);
-    let pc = run_fake_pc(pc_bind, awake_rx);
-
-    info!(%fritz_bind, %pc_bind, ?wake_delay, "Waker lab ready");
-    tokio::try_join!(fritz, pc)?;
-    Ok(())
+    info!(%fritz_bind, %pc_ip, "Waker lab ready");
+    run_fake_fritz(fritz_bind, pc_ip).await
 }
 
-async fn run_fake_fritz(
-    bind: SocketAddr,
-    awake_tx: watch::Sender<bool>,
-    wake_delay: Duration,
-) -> std::io::Result<()> {
+async fn run_fake_fritz(bind: SocketAddr, pc_ip: IpAddr) -> std::io::Result<()> {
     let listener = TcpListener::bind(bind).await?;
     loop {
         let (mut stream, peer) = match listener.accept().await {
@@ -55,7 +42,6 @@ async fn run_fake_fritz(
             }
             Err(error) => return Err(error),
         };
-        let awake_tx = awake_tx.clone();
         tokio::spawn(async move {
             let mut request = Vec::new();
             let mut buffer = [0_u8; 4096];
@@ -84,16 +70,24 @@ async fn run_fake_fritz(
             }
 
             let text = String::from_utf8_lossy(&request);
-            let is_wol =
-                text.contains("X_AVM-DE_WakeOnLANByMACAddress") && text.contains("<NewMACAddress>");
-            if is_wol {
+            let body = if text.contains("X_AVM-DE_WakeOnLANByMACAddress")
+                && text.contains("<NewMACAddress>")
+            {
                 info!(%peer, "fake FRITZ received Wake-on-LAN request");
-                tokio::spawn(async move {
-                    tokio::time::sleep(wake_delay).await;
-                    let _ = awake_tx.send(true);
-                    info!("fake PC is now reachable");
-                });
-                let body = "<?xml version=\"1.0\"?><s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body><u:X_AVM-DE_WakeOnLANByMACAddressResponse xmlns:u=\"urn:dslforum-org:service:Hosts:1\"/></s:Body></s:Envelope>";
+                Some(
+                    "<?xml version=\"1.0\"?><s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body><u:X_AVM-DE_WakeOnLANByMACAddressResponse xmlns:u=\"urn:dslforum-org:service:Hosts:1\"/></s:Body></s:Envelope>"
+                        .to_owned(),
+                )
+            } else if text.contains("GetSpecificHostEntry") && text.contains("<NewMACAddress>") {
+                info!(%peer, %pc_ip, "fake FRITZ received host lookup");
+                Some(format!(
+                    "<?xml version=\"1.0\"?><s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body><u:GetSpecificHostEntryResponse xmlns:u=\"urn:dslforum-org:service:Hosts:1\"><NewIPAddress>{pc_ip}</NewIPAddress><NewActive>1</NewActive></u:GetSpecificHostEntryResponse></s:Body></s:Envelope>"
+                ))
+            } else {
+                None
+            };
+
+            if let Some(body) = body {
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
@@ -109,29 +103,6 @@ async fn run_fake_fritz(
                     .await;
             }
         });
-    }
-}
-
-async fn run_fake_pc(bind: SocketAddr, mut awake: watch::Receiver<bool>) -> std::io::Result<()> {
-    while !*awake.borrow() {
-        if awake.changed().await.is_err() {
-            return Ok(());
-        }
-    }
-
-    let listener = TcpListener::bind(bind).await?;
-    info!(%bind, "fake PC probe port listening");
-    loop {
-        let (mut stream, peer) = match listener.accept().await {
-            Ok(connection) => connection,
-            Err(error) if error.kind() == std::io::ErrorKind::ConnectionAborted => {
-                warn!(%error, "fake PC accept aborted; continuing");
-                continue;
-            }
-            Err(error) => return Err(error),
-        };
-        info!(%peer, "fake PC probe connected");
-        let _ = stream.shutdown().await;
     }
 }
 
