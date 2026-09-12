@@ -3270,7 +3270,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "waker-app"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "android-activity",
  "eframe",
@@ -3280,6 +3280,7 @@ dependencies = [
  "jni",
  "ndk",
  "pollster 0.4.0",
+ "rand",
  "raw-window-handle",
  "tokio",
  "tracing",
@@ -3292,7 +3293,7 @@ dependencies = [
 
 [[package]]
 name = "waker-core"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "serde",
@@ -3303,7 +3304,7 @@ dependencies = [
 
 [[package]]
 name = "waker-lab"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "tokio",
  "tracing",
@@ -3312,7 +3313,7 @@ dependencies = [
 
 [[package]]
 name = "waker-net"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "base64",

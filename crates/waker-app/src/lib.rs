@@ -15,6 +15,7 @@ use std::{
 };
 
 use diagnostics::{DiagnosticsInfo, recent_log_tail};
+use rand::Rng as _;
 use tracing::{Instrument, error, info, info_span};
 use waker_core::{
     MacAddress, WakeBackend, WakeFailure, WakeFailureStage, WakeState, WakeTarget, run_wake,
@@ -30,6 +31,8 @@ const APP_ICON_PNG: &[u8] = include_bytes!("../../../assets/app-icon.png");
 const BIG_LOGO_PNG: &[u8] = include_bytes!("../../../assets/big-logo.png");
 const BACKGROUND_PNG: &[u8] = include_bytes!("../../../assets/background.png");
 const TERMINAL_STATE_DISPLAY_DURATION: Duration = Duration::from_secs(5);
+const CONFETTI_DURATION: Duration = Duration::from_millis(1700);
+const CONFETTI_PARTICLE_COUNT: usize = 50;
 static LAST_ATTEMPT_ID: AtomicU64 = AtomicU64::new(0);
 
 struct ActiveAttempt {
@@ -46,6 +49,75 @@ struct AttemptSummary {
 struct BrandingTextures {
     logo: egui::TextureHandle,
     background: egui::TextureHandle,
+}
+
+#[derive(Clone, Copy)]
+enum ConfettiShape {
+    Rectangle,
+    Triangle,
+}
+
+struct ConfettiParticle {
+    offset: egui::Vec2,
+    velocity: egui::Vec2,
+    rotation: f32,
+    angular_velocity: f32,
+    size: f32,
+    shape: ConfettiShape,
+    colour: egui::Color32,
+}
+
+struct ConfettiBurst {
+    started_at: Instant,
+    origin: egui::Pos2,
+    particles: Vec<ConfettiParticle>,
+}
+
+impl ConfettiBurst {
+    fn new(origin: egui::Pos2) -> Self {
+        let mut rng = rand::rng();
+        let colours = [
+            egui::Color32::from_rgb(254, 211, 95),
+            egui::Color32::from_rgb(253, 129, 40),
+            egui::Color32::from_rgb(181, 230, 253),
+            egui::Color32::from_rgb(1, 96, 202),
+            egui::Color32::from_rgb(240, 255, 255),
+        ];
+
+        let particles = (0..CONFETTI_PARTICLE_COUNT)
+            .map(|_| {
+                let angle = rng.random_range(-2.45_f32..-0.70_f32);
+                let speed = rng.random_range(145.0_f32..320.0_f32);
+                let direction = egui::vec2(angle.cos(), angle.sin());
+                ConfettiParticle {
+                    offset: egui::vec2(
+                        rng.random_range(-24.0_f32..24.0_f32),
+                        rng.random_range(-5.0_f32..5.0_f32),
+                    ),
+                    velocity: direction * speed,
+                    rotation: rng.random_range(0.0_f32..std::f32::consts::TAU),
+                    angular_velocity: rng.random_range(-7.0_f32..7.0_f32),
+                    size: rng.random_range(6.0_f32..11.0_f32),
+                    shape: if rng.random_bool(0.72) {
+                        ConfettiShape::Rectangle
+                    } else {
+                        ConfettiShape::Triangle
+                    },
+                    colour: colours[rng.random_range(0..colours.len())],
+                }
+            })
+            .collect();
+
+        Self {
+            started_at: Instant::now(),
+            origin,
+            particles,
+        }
+    }
+
+    fn elapsed(&self) -> Duration {
+        self.started_at.elapsed()
+    }
 }
 
 #[derive(Default)]
@@ -92,6 +164,8 @@ pub struct WakerApp {
     branding: Option<BrandingTextures>,
     clipboard_status: Option<Result<(), String>>,
     open_log_status: Option<Result<(), String>>,
+    confetti_pending: bool,
+    confetti: Option<ConfettiBurst>,
     #[cfg(target_os = "android")]
     android_app: Option<android_activity::AndroidApp>,
     #[cfg(target_os = "android")]
@@ -143,6 +217,8 @@ impl WakerApp {
             branding: None,
             clipboard_status: None,
             open_log_status: None,
+            confetti_pending: false,
+            confetti: None,
             #[cfg(target_os = "android")]
             android_app: None,
             #[cfg(target_os = "android")]
@@ -485,6 +561,9 @@ impl WakerApp {
             elapsed: active.started.elapsed(),
             failure,
         });
+        if matches!(self.state, WakeState::Awake) {
+            self.confetti_pending = true;
+        }
         if matches!(self.state, WakeState::Awake | WakeState::Failed(_)) {
             self.terminal_state_deadline = Some(Instant::now() + TERMINAL_STATE_DISPLAY_DURATION);
         }
@@ -570,7 +649,7 @@ impl WakerApp {
             WakeState::ResolvingPc => "Finding PC…",
             WakeState::Waking => "Sending wake request…",
             WakeState::WaitingForPc { .. } => "Waiting for PC…",
-            WakeState::Awake => "PC awake",
+            WakeState::Awake => "PC awake!",
         }
     }
 
@@ -1094,6 +1173,88 @@ impl WakerApp {
             Some((snapshot.field, selection_start, selection_end));
     }
 
+    fn start_confetti(&mut self, origin: egui::Pos2) {
+        self.confetti_pending = false;
+        self.confetti = Some(ConfettiBurst::new(origin));
+    }
+
+    fn paint_confetti(&mut self, ctx: &egui::Context) {
+        let Some(burst) = self.confetti.as_ref() else {
+            return;
+        };
+
+        let elapsed = burst.elapsed();
+        if elapsed >= CONFETTI_DURATION {
+            self.confetti = None;
+            return;
+        }
+
+        ctx.request_repaint();
+
+        let t = elapsed.as_secs_f32();
+        let total = CONFETTI_DURATION.as_secs_f32();
+        let fade_start = total * 0.62;
+        let alpha_scale = if t <= fade_start {
+            1.0
+        } else {
+            1.0 - ((t - fade_start) / (total - fade_start)).clamp(0.0, 1.0)
+        };
+        let gravity = 390.0_f32;
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("wake-confetti"),
+        ));
+
+        for particle in &burst.particles {
+            let position = burst.origin
+                + particle.offset
+                + particle.velocity * t
+                + egui::vec2(0.0, 0.5 * gravity * t * t);
+            let rotation = particle.rotation + particle.angular_velocity * t;
+            let colour = particle.colour.gamma_multiply(alpha_scale);
+            Self::paint_confetti_piece(
+                &painter,
+                position,
+                particle.size,
+                rotation,
+                colour,
+                particle.shape,
+            );
+        }
+    }
+
+    fn paint_confetti_piece(
+        painter: &egui::Painter,
+        centre: egui::Pos2,
+        size: f32,
+        rotation: f32,
+        colour: egui::Color32,
+        shape: ConfettiShape,
+    ) {
+        let rotate = |v: egui::Vec2| {
+            let (sin, cos) = rotation.sin_cos();
+            egui::vec2(v.x * cos - v.y * sin, v.x * sin + v.y * cos)
+        };
+        let points = match shape {
+            ConfettiShape::Rectangle => vec![
+                centre + rotate(egui::vec2(-0.60 * size, -0.32 * size)),
+                centre + rotate(egui::vec2(0.60 * size, -0.32 * size)),
+                centre + rotate(egui::vec2(0.60 * size, 0.32 * size)),
+                centre + rotate(egui::vec2(-0.60 * size, 0.32 * size)),
+            ],
+            ConfettiShape::Triangle => vec![
+                centre + rotate(egui::vec2(0.0, -0.72 * size)),
+                centre + rotate(egui::vec2(0.65 * size, 0.50 * size)),
+                centre + rotate(egui::vec2(-0.65 * size, 0.50 * size)),
+            ],
+        };
+        painter.add(egui::Shape::convex_polygon(
+            points,
+            colour,
+            egui::Stroke::NONE,
+        ));
+    }
+
     fn render_settings(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
         ui.scope(|ui| {
             ui.visuals_mut().collapsing_header_frame = true;
@@ -1135,6 +1296,50 @@ impl WakerApp {
         });
     }
 
+    fn render_wake_button(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let wake_succeeded = matches!(self.state, WakeState::Awake);
+        let wake_label_colour = if wake_succeeded {
+            egui::Color32::WHITE
+        } else {
+            egui::Color32::from_rgb(32, 24, 16)
+        };
+        let wake_label = egui::RichText::new(self.wake_button_label())
+            .size(22.0)
+            .strong()
+            .color(wake_label_colour);
+        let wake_button_colour = if wake_succeeded {
+            egui::Color32::from_rgb(248, 160, 56)
+        } else {
+            egui::Color32::from_rgb(181, 230, 253)
+        };
+        let wake_button = egui::Button::new(wake_label)
+            .fill(wake_button_colour)
+            .min_size(egui::vec2(160.0, 52.0));
+        let wake_enabled = !self.busy
+            && !wake_succeeded
+            && self.status_check_rx.is_none()
+            && self.ping_check_rx.is_none();
+        let wake_response = ui
+            .scope(|ui| {
+                if wake_succeeded {
+                    ui.visuals_mut().disabled_alpha = 1.0;
+                }
+                ui.add_enabled(wake_enabled, wake_button)
+            })
+            .inner;
+
+        if wake_response.clicked() {
+            self.begin_wake(ctx);
+        }
+        if self.confetti_pending {
+            self.start_confetti(wake_response.rect.center());
+        }
+
+        if matches!(self.state, WakeState::Failed(_)) {
+            ui.add_space(6.0);
+            self.render_wake_error(ui);
+        }
+    }
     fn show_ui(&mut self, ui: &mut egui::Ui) {
         self.drain_state_updates();
         self.drain_host_status_update();
@@ -1189,31 +1394,7 @@ impl WakerApp {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.vertical_centered(|ui| {
                         self.render_branding_logo(ui);
-
-                        let wake_label = egui::RichText::new(self.wake_button_label())
-                            .size(22.0)
-                            .strong()
-                            .color(egui::Color32::from_rgb(32, 24, 16));
-                        let wake_button = egui::Button::new(wake_label)
-                            .fill(egui::Color32::from_rgb(248, 160, 56))
-                            .min_size(egui::vec2(160.0, 52.0));
-                        if ui
-                            .add_enabled(
-                                !self.busy
-                                    && !matches!(self.state, WakeState::Awake)
-                                    && self.status_check_rx.is_none()
-                                    && self.ping_check_rx.is_none(),
-                                wake_button,
-                            )
-                            .clicked()
-                        {
-                            self.begin_wake(&ctx);
-                        }
-
-                        if matches!(self.state, WakeState::Failed(_)) {
-                            ui.add_space(6.0);
-                            self.render_wake_error(ui);
-                        }
+                        self.render_wake_button(ui, &ctx);
                     });
 
                     ui.add_space(16.0);
@@ -1224,6 +1405,7 @@ impl WakerApp {
                 });
             });
         });
+        self.paint_confetti(&ctx);
     }
 }
 
@@ -1648,7 +1830,7 @@ mod tests {
         assert_eq!(app.wake_button_label(), "Waiting for PC…");
 
         app.state = WakeState::Awake;
-        assert_eq!(app.wake_button_label(), "PC awake");
+        assert_eq!(app.wake_button_label(), "PC awake!");
 
         app.state = WakeState::Failed(WakeFailure::new(WakeFailureStage::Timeout, "test failure"));
         assert_eq!(app.wake_button_label(), "Wake");
@@ -1729,7 +1911,7 @@ mod tests {
     }
 
     #[test]
-    fn finishing_wake_attempt_schedules_terminal_state_reset() {
+    fn finishing_successful_wake_attempt_schedules_reset_and_confetti() {
         let mut app = WakerApp {
             state: WakeState::Awake,
             active_attempt: Some(ActiveAttempt {
@@ -1743,6 +1925,27 @@ mod tests {
 
         assert!(app.last_attempt.is_some());
         assert!(app.terminal_state_deadline.is_some());
+        assert!(app.confetti_pending);
+        assert!(app.confetti.is_none());
+    }
+
+    #[test]
+    fn finishing_failed_wake_attempt_does_not_schedule_confetti() {
+        let mut app = WakerApp {
+            state: WakeState::Failed(WakeFailure::new(WakeFailureStage::Timeout, "test failure")),
+            active_attempt: Some(ActiveAttempt {
+                id: 42,
+                started: Instant::now(),
+            }),
+            ..WakerApp::default()
+        };
+
+        app.finish_attempt();
+
+        assert!(app.last_attempt.is_some());
+        assert!(app.terminal_state_deadline.is_some());
+        assert!(!app.confetti_pending);
+        assert!(app.confetti.is_none());
     }
 
     #[test]
