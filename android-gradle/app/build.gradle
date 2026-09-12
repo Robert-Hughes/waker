@@ -1,0 +1,48 @@
+plugins {
+    id "com.android.application"
+}
+
+def wakerVersionName = providers.gradleProperty("wakerVersionName").orElse("0.0.0")
+def wakerVersionCode = providers.gradleProperty("wakerVersionCode").orElse("1")
+
+android {
+    namespace = "app.waker.android"
+    compileSdk = 36
+
+    defaultConfig {
+        applicationId = "app.waker.android"
+        minSdk = 24
+        targetSdk = 36
+        versionName = wakerVersionName.get()
+        versionCode = Integer.parseInt(wakerVersionCode.get())
+    }
+
+    sourceSets {
+        main {
+            manifest.srcFile("src/main/AndroidManifest.xml")
+            java.srcDirs = [
+                "src/main/java",
+                file("${rootDir}/../crates/waker-app/android-java"),
+            ]
+            res.srcDirs = ["src/main/res", file("${rootDir}/../crates/waker-app/android-res")]
+            jniLibs.srcDirs = [file("${rootDir}/../target/android-jniLibs")]
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled = false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+}
+
+dependencies {
+    implementation "androidx.appcompat:appcompat:1.8.0"
+    implementation "androidx.core:core:1.17.0"
+    implementation "androidx.games:games-activity:4.4.0"
+}

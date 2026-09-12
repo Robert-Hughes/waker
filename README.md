@@ -101,12 +101,12 @@ cargo run -p waker-lab
 
 ## Android
 
-The Android application is Rust-first: `waker-app` builds as a `cdylib` and uses winit's `NativeActivity` backend through eframe. A small Java helper is packaged only for handing sanitised logs to Android's MediaStore/viewer intent flow. Waker requests only normal internet access and does **not** request Android VPN permission.
+The Android application is Rust-first: `waker-app` builds as a `cdylib` and drives AndroidX GameActivity directly through `android-activity`, with egui rendered by `egui-wgpu`/wgpu. eframe/winit remain desktop-only integration dependencies. A tiny `WakerActivity` subclass supplies the Android host type, while the existing Java log helper hands sanitised logs to Android's MediaStore/viewer intent flow. Waker requests only normal internet access and does **not** request Android VPN permission.
 
-The Cargo manifest uses display name **Waker** and package name `app.waker.android`. Android packaging requires a Rust Android toolchain and an APK packager compatible with the manifest metadata in `crates/waker-app/Cargo.toml`; host-specific SDK/NDK setup is intentionally kept outside this repository.
-Release signing, the local ignored keystore, the repeatable release-build command, and the one-time debug-to-release migration are documented in [`docs/RELEASE.md`](docs/RELEASE.md). The NativeActivity configuration-change workaround required by the current winit/android-activity stack is documented in [`docs/ANDROID-LIFECYCLE.md`](docs/ANDROID-LIFECYCLE.md).
+The Android package name is `app.waker.android` and display name is **Waker**. Cargo builds the native Rust library; a small Gradle packaging project resolves GameActivity/AppCompat and produces the final AndroidX-aware APK. Host-specific SDK/NDK setup remains outside the repository, while the packaging definition itself is versioned under `android-gradle/`.
+Release signing, the local ignored keystore, the repeatable release-build command, and the one-time debug-to-release migration are documented in [`docs/RELEASE.md`](docs/RELEASE.md). The direct GameActivity architecture, the reasons Android no longer uses winit, and the lifecycle/input validation requirements are documented in [`docs/ANDROID-LIFECYCLE.md`](docs/ANDROID-LIFECYCLE.md).
 
-Android debug builds, NativeActivity launch, diagnostics, S3 wake, and a mobile-data wake from outside the home LAN have all been exercised during development. Production wake readiness resolves the target's current IPv4 address from the FRITZ!Box Hosts service and polls ICMP through Waker's private userspace tunnel; this was selected after repeated S3 timing tests against both the former TCP probe and FRITZ!Box `NewActive`.
+Android diagnostics, S3 wake, and a mobile-data wake from outside the home LAN have all been exercised during development. Production wake readiness resolves the target's current IPv4 address from the FRITZ!Box Hosts service and polls ICMP through Waker's private userspace tunnel; this was selected after repeated S3 timing tests against both the former TCP probe and FRITZ!Box `NewActive`.
 
 On Android, the default WireGuard profile path is `<internalDataPath>/waker.local.conf`. Development profiles should be provisioned there through app-private storage; they should not be copied to shared `/sdcard` storage.
 

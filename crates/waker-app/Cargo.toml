@@ -14,7 +14,7 @@ name = "waker"
 path = "src/main.rs"
 
 [dependencies]
-eframe.workspace = true
+egui.workspace = true
 image.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -22,11 +22,19 @@ tracing-appender.workspace = true
 tracing-subscriber.workspace = true
 waker-core = { path = "../waker-core" }
 waker-net = { path = "../waker-net" }
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+eframe.workspace = true
 winit.workspace = true
 
 [target.'cfg(target_os = "android")'.dependencies]
-tracing-logcat = "0.1.0"
+android-activity = { version = "0.6.1", features = ["game-activity"] }
+egui-wgpu = "0.36.2"
 jni = "0.22.4"
+pollster = "0.4.0"
+raw-window-handle = "0.6.2"
+ndk = { version = "0.9.0", default-features = false, features = ["rwh_06"] }
+tracing-logcat = "0.1.0"
 
 [package.metadata.android]
 package = "app.waker.android"
@@ -42,10 +50,8 @@ label = "Waker"
 icon = "@mipmap/ic_launcher"
 
 [[package.metadata.android.application.activity]]
-name = "android.app.NativeActivity"
+name = "com.google.androidgamesdk.GameActivity"
 exported = true
-# winit 0.30 cannot safely recreate its NativeActivity event loop; handle
-# target-SDK-known configuration changes in place instead of relaunching.
 config_changes = "allKnown"
 
 [[package.metadata.android.application.activity.meta_data]]

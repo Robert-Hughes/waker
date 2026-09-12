@@ -167,8 +167,16 @@ fn desktop_log_dir() -> Option<PathBuf> {
 }
 
 #[cfg(target_os = "android")]
+static ANDROID_DIAGNOSTICS: std::sync::OnceLock<DiagnosticsRuntime> = std::sync::OnceLock::new();
+
+#[cfg(target_os = "android")]
 #[must_use]
-pub fn init_android(internal_data_path: Option<PathBuf>) -> DiagnosticsRuntime {
+pub fn init_android(internal_data_path: Option<PathBuf>) -> &'static DiagnosticsRuntime {
+    ANDROID_DIAGNOSTICS.get_or_init(|| init_android_once(internal_data_path))
+}
+
+#[cfg(target_os = "android")]
+fn init_android_once(internal_data_path: Option<PathBuf>) -> DiagnosticsRuntime {
     use tracing_logcat::{LogcatMakeWriter, LogcatTag};
 
     let level = log_level();

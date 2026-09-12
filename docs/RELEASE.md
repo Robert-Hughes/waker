@@ -32,8 +32,11 @@ The signed APK is produced at:
 target/release/apk/waker_app.apk
 ```
 
-The build helper sources the ignored signing environment and invokes the native FreeBSD Android build wrapper with `--release`.
-cargo-apk2 derives Android `versionCode` from the Cargo package version. **Bump `[workspace.package].version` for every APK intended to update an installed build**; otherwise some Android package installers may reject the sideload as not being a newer version.
+The build helper sources the ignored signing environment and runs a two-stage Android build. cargo-apk2 drives the native Rust/NDK build and supplies the canonical Android versionName/versionCode. Gradle then resolves AndroidX GameActivity/AppCompat, packages the Rust `cdylib`, aligns the APK, and the helper signs it with the existing Waker release key. The final output path remains unchanged.
+
+The Gradle stage uses a checksum-pinned official Android Build Tools 36 archive cached under ignored `target/` because AGP validates a complete Build Tools package; Waker's native FreeBSD AAPT2 is explicitly used for resource processing. The installed Android SDK is not modified. Gradle and the AndroidX dependencies are therefore build requirements in addition to the existing Rust Android toolchain.
+
+cargo-apk2 derives Android `versionCode` from the Cargo package version, and the Gradle package copies that exact value. **Bump `[workspace.package].version` for every APK intended to update an installed build**; otherwise some Android package installers may reject the sideload as not being a newer version.
 
 ## First migration from a debug build
 

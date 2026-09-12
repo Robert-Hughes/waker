@@ -1,3 +1,5 @@
+#[cfg(target_os = "android")]
+mod android;
 mod diagnostics;
 
 use std::{
@@ -13,7 +15,6 @@ use std::{
 };
 
 use diagnostics::{DiagnosticsInfo, recent_log_tail};
-use eframe::egui;
 use tracing::{Instrument, error, info, info_span};
 use waker_core::{
     MacAddress, WakeBackend, WakeFailure, WakeFailureStage, WakeState, WakeTarget, run_wake,
@@ -53,6 +54,24 @@ struct WakerFileSettings {
     pc_mac: Option<String>,
 }
 
+#[cfg(target_os = "android")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AndroidTextField {
+    ConfigPath,
+    FritzIp,
+    PcMac,
+}
+
+#[cfg(target_os = "android")]
+#[derive(Clone, Debug)]
+struct AndroidTextInputSnapshot {
+    field: AndroidTextField,
+    text: String,
+    selection_start: usize,
+    selection_end: usize,
+    clicked: bool,
+}
+
 pub struct WakerApp {
     config_path: String,
     fritz_ip: String,
@@ -74,9 +93,13 @@ pub struct WakerApp {
     clipboard_status: Option<Result<(), String>>,
     open_log_status: Option<Result<(), String>>,
     #[cfg(target_os = "android")]
-    android_app: Option<winit::platform::android::activity::AndroidApp>,
+    android_app: Option<android_activity::AndroidApp>,
     #[cfg(target_os = "android")]
     android_system_insets: Option<AndroidSystemInsets>,
+    #[cfg(target_os = "android")]
+    android_text_input: Option<AndroidTextInputSnapshot>,
+    #[cfg(target_os = "android")]
+    android_text_selection_override: Option<(AndroidTextField, usize, usize)>,
 }
 
 impl Default for WakerApp {
@@ -124,6 +147,10 @@ impl WakerApp {
             android_app: None,
             #[cfg(target_os = "android")]
             android_system_insets: None,
+            #[cfg(target_os = "android")]
+            android_text_input: None,
+            #[cfg(target_os = "android")]
+            android_text_selection_override: None,
         }
     }
 
@@ -793,7 +820,7 @@ struct AndroidSystemInsets {
 #[cfg(target_os = "android")]
 #[allow(unsafe_code)]
 fn android_system_window_insets(
-    app: &winit::platform::android::activity::AndroidApp,
+    app: &android_activity::AndroidApp,
 ) -> Result<Option<AndroidSystemInsets>, String> {
     use jni::{JavaVM, jni_sig, jni_str, objects::JObject};
 
@@ -877,10 +904,7 @@ fn android_system_window_insets(
 
 #[cfg(target_os = "android")]
 #[allow(unsafe_code)]
-fn android_open_log(
-    app: &winit::platform::android::activity::AndroidApp,
-    text: &str,
-) -> Result<(), String> {
+fn android_open_log(app: &android_activity::AndroidApp, text: &str) -> Result<(), String> {
     use jni::{
         JavaVM, jni_sig, jni_str,
         objects::{JObject, JValue},
@@ -917,10 +941,7 @@ fn android_open_log(
 
 #[cfg(target_os = "android")]
 #[allow(unsafe_code)]
-fn android_copy_text(
-    app: &winit::platform::android::activity::AndroidApp,
-    text: &str,
-) -> Result<(), String> {
+fn android_copy_text(app: &android_activity::AndroidApp, text: &str) -> Result<(), String> {
     use jni::{
         JavaVM, jni_sig, jni_str,
         objects::{JObject, JValue},
@@ -964,9 +985,9 @@ fn android_copy_text(
     .map_err(|error| error.to_string())
 }
 
-impl eframe::App for WakerApp {
+impl WakerApp {
     #[cfg(target_os = "android")]
-    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+    fn apply_android_raw_input(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         let Some(android_app) = &self.android_app else {
             return;
         };
@@ -1003,11 +1024,126 @@ impl eframe::App for WakerApp {
         }));
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    #[cfg(target_os = "android")]
+    fn capture_android_text_edit(
+        &mut self,
+        ctx: &egui::Context,
+        field: AndroidTextField,
+        output: &mut egui::widgets::text_edit::TextEditOutput,
+    ) {
+        if let Some((override_field, start, end)) = self.android_text_selection_override.take() {
+            if override_field == field {
+                let range = egui::text::CCursorRange::two(
+                    egui::text::CCursor::new(start),
+                    egui::text::CCursor::new(end),
+                );
+                output.state.cursor.set_char_range(Some(range));
+                output.state.clone().store(ctx, output.response.id);
+                output.cursor_range = Some(range);
+            } else {
+                self.android_text_selection_override = Some((override_field, start, end));
+            }
+        }
+
+        if !output.response.has_focus() {
+            return;
+        }
+
+        let text = match field {
+            AndroidTextField::ConfigPath => self.config_path.clone(),
+            AndroidTextField::FritzIp => self.fritz_ip.clone(),
+            AndroidTextField::PcMac => self.pc_mac.clone(),
+        };
+        let fallback = text.chars().count();
+        let (selection_start, selection_end) = output
+            .cursor_range
+            .map(|range| {
+                (
+                    usize::from(range.primary.index),
+                    usize::from(range.secondary.index),
+                )
+            })
+            .unwrap_or((fallback, fallback));
+
+        self.android_text_input = Some(AndroidTextInputSnapshot {
+            field,
+            text,
+            selection_start,
+            selection_end,
+            clicked: output.response.clicked(),
+        });
+    }
+
+    #[cfg(target_os = "android")]
+    fn apply_android_text_input_state(
+        &mut self,
+        text: String,
+        selection_start: usize,
+        selection_end: usize,
+    ) {
+        let Some(snapshot) = self.android_text_input.clone() else {
+            return;
+        };
+
+        match snapshot.field {
+            AndroidTextField::ConfigPath => self.config_path = text,
+            AndroidTextField::FritzIp => self.fritz_ip = text,
+            AndroidTextField::PcMac => self.pc_mac = text,
+        }
+        self.android_text_selection_override =
+            Some((snapshot.field, selection_start, selection_end));
+    }
+
+    fn render_settings(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
+        ui.scope(|ui| {
+            ui.visuals_mut().collapsing_header_frame = true;
+            ui.collapsing("Settings", |ui| {
+                ui.label("WireGuard profile");
+                #[cfg(target_os = "android")]
+                {
+                    let mut output = egui::TextEdit::singleline(&mut self.config_path).show(ui);
+                    self.capture_android_text_edit(_ctx, AndroidTextField::ConfigPath, &mut output);
+                }
+                #[cfg(not(target_os = "android"))]
+                ui.text_edit_singleline(&mut self.config_path);
+
+                ui.horizontal(|ui| {
+                    ui.label("FRITZ!Box");
+                    #[cfg(target_os = "android")]
+                    {
+                        let mut output = egui::TextEdit::singleline(&mut self.fritz_ip).show(ui);
+                        self.capture_android_text_edit(
+                            _ctx,
+                            AndroidTextField::FritzIp,
+                            &mut output,
+                        );
+                    }
+                    #[cfg(not(target_os = "android"))]
+                    ui.text_edit_singleline(&mut self.fritz_ip);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("PC MAC");
+                    #[cfg(target_os = "android")]
+                    {
+                        let mut output = egui::TextEdit::singleline(&mut self.pc_mac).show(ui);
+                        self.capture_android_text_edit(_ctx, AndroidTextField::PcMac, &mut output);
+                    }
+                    #[cfg(not(target_os = "android"))]
+                    ui.text_edit_singleline(&mut self.pc_mac);
+                });
+            });
+        });
+    }
+
+    fn show_ui(&mut self, ui: &mut egui::Ui) {
         self.drain_state_updates();
         self.drain_host_status_update();
         self.drain_ping_update();
         let ctx = ui.ctx().clone();
+        #[cfg(target_os = "android")]
+        {
+            self.android_text_input = None;
+        }
         if let Some(remaining) = self.update_terminal_state_timeout(Instant::now()) {
             ctx.request_repaint_after(remaining);
         }
@@ -1082,27 +1218,19 @@ impl eframe::App for WakerApp {
 
                     ui.add_space(16.0);
                     ui.separator();
-                    ui.scope(|ui| {
-                        ui.visuals_mut().collapsing_header_frame = true;
-                        ui.collapsing("Settings", |ui| {
-                            ui.label("WireGuard profile");
-                            ui.text_edit_singleline(&mut self.config_path);
-
-                            ui.horizontal(|ui| {
-                                ui.label("FRITZ!Box");
-                                ui.text_edit_singleline(&mut self.fritz_ip);
-                            });
-                            ui.horizontal(|ui| {
-                                ui.label("PC MAC");
-                                ui.text_edit_singleline(&mut self.pc_mac);
-                            });
-                        });
-                    });
+                    self.render_settings(ui, &ctx);
                     ui.separator();
                     self.render_diagnostics(ui, &ctx);
                 });
             });
         });
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+impl eframe::App for WakerApp {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.show_ui(ui);
     }
 }
 
@@ -1453,48 +1581,6 @@ pub fn run_desktop(diagnostics_runtime: DiagnosticsRuntime) -> eframe::Result {
     }
     drop(diagnostics_runtime);
     result
-}
-
-#[cfg(target_os = "android")]
-#[allow(unsafe_code)]
-#[unsafe(no_mangle)]
-pub fn android_main(app: winit::platform::android::activity::AndroidApp) {
-    let internal_data_path = app.internal_data_path();
-    let default_config_path = internal_data_path
-        .as_ref()
-        .map(|path| path.join("waker.local.conf"));
-    let diagnostics_runtime = diagnostics::init_android(internal_data_path);
-    let diagnostics_info = diagnostics_runtime.info().clone();
-    info!(
-        persistent_logging = diagnostics_runtime.is_persistent(),
-        log_dir = ?diagnostics_info.log_dir,
-        warning = ?diagnostics_info.warning,
-        "Waker starting"
-    );
-    if let Err(error) = android_open_log(&app, "Waker Open log integration test\n") {
-        error!(%error, "temporary Open log integration test failed");
-    }
-    let clipboard_app = app.clone();
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_title(APP_NAME),
-        android_app: Some(app),
-        ..Default::default()
-    };
-
-    let result = eframe::run_native(
-        APP_NAME,
-        options,
-        Box::new(move |creation_context| {
-            let mut app = WakerApp::new(diagnostics_info.clone(), default_config_path.clone());
-            app.install_branding(&creation_context.egui_ctx);
-            app.android_app = Some(clipboard_app.clone());
-            Ok(Box::new(app))
-        }),
-    );
-    if let Err(error) = result {
-        error!(%error, "Android event loop failed");
-    }
-    drop(diagnostics_runtime);
 }
 
 #[cfg(test)]

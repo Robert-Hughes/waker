@@ -1,4 +1,7 @@
 /target
+/android-gradle/.gradle/
+/android-gradle/build/
+/android-gradle/app/build/
 *.log
 *.pcap
 *.pcapng
