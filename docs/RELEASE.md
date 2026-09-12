@@ -19,7 +19,7 @@ The private password is deliberately not documented or committed. The local `.si
 
 ## Build
 
-On Manta/GhostBSD:
+On the GhostBSD development host:
 
 ```sh
 cd ~/src/waker
@@ -32,15 +32,15 @@ The signed APK is produced at:
 target/release/apk/waker_app.apk
 ```
 
-The build helper sources the ignored signing environment and runs a two-stage Android build. cargo-apk2 drives the native Rust/NDK build and supplies the canonical Android versionName/versionCode. Gradle then resolves AndroidX GameActivity/AppCompat, packages the Rust `cdylib`, aligns the APK, and the helper signs it with the existing Waker release key. The final output path remains unchanged.
+The build helper sources the ignored signing environment and runs a two-stage Android build. cargo-apk2 drives the native Rust/NDK build and supplies the canonical Android versionName/versionCode. The checked-in Gradle wrapper then resolves AndroidX GameActivity/AppCompat, packages the Rust `cdylib`, aligns the APK, and the helper signs it with the existing Waker release key. The final output path remains unchanged.
 
-The Gradle stage uses a checksum-pinned official Android Build Tools 36 archive cached under ignored `target/` because AGP validates a complete Build Tools package; Waker's native FreeBSD AAPT2 is explicitly used for resource processing. The installed Android SDK is not modified. Gradle and the AndroidX dependencies are therefore build requirements in addition to the existing Rust Android toolchain.
+The Gradle wrapper pins Gradle 9.6.1 and verifies the distribution checksum. The Gradle stage also uses a checksum-pinned official Android Build Tools 36 archive cached under ignored `target/` because AGP validates a complete Build Tools package; Waker's native FreeBSD AAPT2 is explicitly used for resource processing. The installed Android SDK is not modified. A Java runtime and network access for uncached Gradle/AndroidX artifacts are required in addition to the existing Rust Android toolchain.
 
 cargo-apk2 derives Android `versionCode` from the Cargo package version, and the Gradle package copies that exact value. **Bump `[workspace.package].version` for every APK intended to update an installed build**; otherwise some Android package installers may reject the sideload as not being a newer version.
 
 ## First migration from a debug build
 
-Android requires updates to a package to carry the same signing certificate. The development APKs installed before this release were signed with Manta's Android debug key, while production releases use the Waker-specific release key above.
+Android requires updates to a package to carry the same signing certificate. Development APKs installed before this release were signed with the development host's Android debug key, while production releases use the Waker-specific release key above.
 
 Therefore the first production-key installation cannot update the existing debug-signed `app.waker.android` in place. Uninstalling the debug build also deletes its app-private `waker.local.conf`.
 

@@ -12,6 +12,7 @@ game_build_tools_sha256=5d9ac77fb6ff43d9da518a337b4fcf8f9097113df531d99ccefe80ef
 game_sdk="$repo_root/target/android-game-sdk"
 game_build_tools_archive="$repo_root/target/android-game-build-tools.zip"
 game_build_tools_stamp="$game_sdk/.build-tools-sha256"
+gradle_wrapper="$repo_root/android-gradle/gradlew"
 
 if [ ! -r "$signing_env" ]; then
     echo "Missing private signing environment: $signing_env" >&2
@@ -21,13 +22,17 @@ if [ ! -x "$builder" ]; then
     echo "Android build wrapper not executable: $builder" >&2
     exit 1
 fi
+if [ ! -x "$gradle_wrapper" ]; then
+    echo "Gradle wrapper not executable: $gradle_wrapper" >&2
+    exit 1
+fi
 for tool in aapt2 zipalign apksigner; do
     if [ ! -x "$native_build_tools/$tool" ]; then
         echo "Missing native Android build tool: $native_build_tools/$tool" >&2
         exit 1
     fi
 done
-for tool in fetch gradle sha256 unzip; do
+for tool in fetch sha256 unzip; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         echo "Required Android build tool not found in PATH: $tool" >&2
         exit 1
@@ -42,17 +47,23 @@ done
 
 cd "$repo_root"
 
+final_apk="$repo_root/target/release/apk/waker_app.apk"
+cargo_apk_output="$final_apk"
+intermediate_apk="$repo_root/target/android-cargo-apk-intermediate.apk"
+signed_apk="$repo_root/target/android-game-activity-signed.apk"
+rm -f "$final_apk" "$intermediate_apk" "$signed_apk"
+
 # cargo-apk2 remains the native Rust build driver. Its APK is intermediate:
 # the final package is assembled by Gradle so AndroidX GameActivity and
 # GameTextInput dependencies are resolved correctly.
 "$builder" build --release -p waker-app --lib --target aarch64-linux-android
 
-intermediate_apk="$repo_root/target/release/apk/waker_app.apk"
 native_library="$repo_root/target/aarch64-linux-android/release/libwaker_app.so"
-if [ ! -r "$intermediate_apk" ] || [ ! -r "$native_library" ]; then
+if [ ! -r "$cargo_apk_output" ] || [ ! -r "$native_library" ]; then
     echo "Native Android build did not produce the expected outputs" >&2
     exit 1
 fi
+mv "$cargo_apk_output" "$intermediate_apk"
 
 package_line=$("$native_build_tools/aapt2" dump badging "$intermediate_apk" | sed -n '1p')
 version_code=$(printf '%s\n' "$package_line" | sed -n "s/.*versionCode='\([^']*\)'.*/\1/p")
@@ -62,7 +73,7 @@ if [ -z "$version_code" ] || [ -z "$version_name" ]; then
     exit 1
 fi
 
-# AGP expects a complete official Build Tools package. Manta's normal Android
+# AGP expects a complete official Build Tools package. The GhostBSD Android
 # SDK uses native FreeBSD build-tool binaries, so keep an official Linux Build
 # Tools copy only inside target/ for AGP's Java-side tooling and metadata.
 # aapt2 is explicitly overridden below with the working FreeBSD binary.
@@ -98,18 +109,28 @@ jni_dir="$repo_root/target/android-jniLibs/arm64-v8a"
 mkdir -p "$jni_dir"
 cp "$native_library" "$jni_dir/libwaker_app.so"
 
-ANDROID_HOME="$game_sdk" ANDROID_SDK_ROOT="$game_sdk" gradle --no-daemon -p "$repo_root/android-gradle"     -Pandroid.aapt2FromMavenOverride="$native_build_tools/aapt2"     -PwakerVersionName="$version_name"     -PwakerVersionCode="$version_code"     :app:assembleRelease
+ANDROID_HOME="$game_sdk" \
+ANDROID_SDK_ROOT="$game_sdk" \
+"$gradle_wrapper" --no-daemon -p "$repo_root/android-gradle" \
+    -Pandroid.aapt2FromMavenOverride="$native_build_tools/aapt2" \
+    -PwakerVersionName="$version_name" \
+    -PwakerVersionCode="$version_code" \
+    :app:assembleRelease
 
 unsigned_apk="$repo_root/android-gradle/app/build/outputs/apk/release/app-release-unsigned.apk"
 aligned_apk="$repo_root/target/android-game-activity-aligned.apk"
-final_apk="$repo_root/target/release/apk/waker_app.apk"
 if [ ! -r "$unsigned_apk" ]; then
     echo "Gradle did not produce the expected release APK" >&2
     exit 1
 fi
 
 "$native_build_tools/zipalign" -f 4 "$unsigned_apk" "$aligned_apk"
-"$native_build_tools/apksigner" sign     --ks "$CARGO_APK_RELEASE_KEYSTORE"     --ks-pass env:CARGO_APK_RELEASE_KEYSTORE_PASSWORD     --out "$final_apk"     "$aligned_apk"
-"$native_build_tools/apksigner" verify --verbose "$final_apk"
+"$native_build_tools/apksigner" sign \
+    --ks "$CARGO_APK_RELEASE_KEYSTORE" \
+    --ks-pass env:CARGO_APK_RELEASE_KEYSTORE_PASSWORD \
+    --out "$signed_apk" \
+    "$aligned_apk"
+"$native_build_tools/apksigner" verify --verbose "$signed_apk"
+mv "$signed_apk" "$final_apk"
 
 echo "Signed GameActivity APK: $final_apk"

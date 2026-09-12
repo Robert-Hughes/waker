@@ -12,11 +12,11 @@ WakerApp / egui UI
     └── GameActivity → android-activity → egui → egui-wgpu → wgpu
 ```
 
-The Java/Kotlin side is intentionally small. `WakerActivity` subclasses GameActivity without application logic, and the existing `LogOpener` helper exports a sanitised log through MediaStore. Rendering, networking, UI state and lifecycle handling remain in Rust.
+The Java/Kotlin side is intentionally small. `WakerActivity` subclasses GameActivity without application logic, and the existing `LogOpener` helper exports a credential-sanitised log through MediaStore. Rendering, networking, UI state and lifecycle handling remain in Rust.
 
 ## Why Android does not use winit
 
-This is an intentional response to two Android lifecycle failures captured on the target Samsung Fold on 11 September 2026.
+This is an intentional response to two Android lifecycle failures captured on the target Android foldable on 11 September 2026.
 
 The first failure occurred during unlock. Android detected a `CONFIG_UI_MODE` change and attempted to recreate Waker's Activity. The old Activity became logically resumed/visible while its real window remained hidden and surface-less, leaving the splash screen stuck above it.
 
@@ -104,16 +104,16 @@ GameActivity is an AndroidX AAR dependency, so the final APK needs Gradle depend
 `scripts/build-release-android.sh` performs the release pipeline:
 
 1. cargo-apk2 builds the Android Rust `cdylib` and provides the canonical versionName/versionCode derived from the Cargo package version;
-2. the Rust `libwaker_app.so` is copied into the Gradle package's JNI inputs;
-3. Gradle resolves GameActivity 4.4.0 plus its AppCompat/Core dependencies and assembles the final Android application;
-4. Waker's existing release key signs the Gradle APK;
-5. the final signed output remains `target/release/apk/waker_app.apk`.
+2. its intermediate APK is moved away from the release output path so a later packaging failure cannot leave an incomplete APK looking like a finished release;
+3. the Rust `libwaker_app.so` is copied into the Gradle package's JNI inputs;
+4. the checksum-pinned Gradle 9.6.1 wrapper resolves GameActivity 4.4.0 plus its AppCompat/Core dependencies and assembles the final Android application;
+5. Waker's existing release key signs a temporary APK, verifies that signature, then publishes it atomically as `target/release/apk/waker_app.apk`.
 
-Manta's installed Android Build Tools contain native FreeBSD replacements sufficient for cargo-apk2, but AGP validates a complete official Build Tools distribution. The helper therefore keeps a checksum-pinned official Build Tools 36 package under ignored `target/` solely for the Gradle build environment, while explicitly overriding AAPT2 with the working native FreeBSD binary. It does not modify the installed SDK.
+The development GhostBSD host's installed Android Build Tools contain native FreeBSD replacements sufficient for cargo-apk2, but AGP validates a complete official Build Tools distribution. The helper therefore keeps a checksum-pinned official Build Tools 36 package under ignored `target/` solely for the Gradle build environment, while explicitly overriding AAPT2 with the working native FreeBSD binary. It does not modify the installed SDK.
 
 ## Validation
 
-The winit-free direct lifecycle was validated on the target Samsung Fold before the GameActivity switch:
+The winit-free direct lifecycle was validated on the target Android foldable before the GameActivity switch:
 
 - fresh launch produced a real drawable Vulkan/wgpu window;
 - ordinary surface loss/recreation worked;
@@ -122,12 +122,12 @@ The winit-free direct lifecycle was validated on the target Samsung Fold before 
 - touch interaction and Open log worked;
 - persistent diagnostics survived Activity recreation.
 
-The GameActivity build was then validated on the same Fold on 12 September 2026:
+The GameActivity build was then validated on the same device on 12 September 2026:
 
 - the signed `0.1.4` APK launched `app.waker.android.WakerActivity`; GameActivity loaded `libwaker_app.so` from `android.app.lib_name`, and Waker reached `mHasSurface=true`, `HAS_DRAWN`, visible/on-screen;
-- focusing a Settings field created a real `com.google.androidgamesdk.gametextinput.InputConnection` and showed the Samsung keyboard;
+- focusing a Settings field created a real `com.google.androidgamesdk.gametextinput.InputConnection` and showed the system keyboard;
 - manually hiding the keyboard left that input connection served, and tapping the still-focused field explicitly reopened the keyboard;
-- after removing per-frame state publication, the input-restart count remained unchanged while a real Samsung-keyboard tap produced `setComposingText("a")`, and a real spacebar tap produced `finishComposingText` plus `commitText`;
+- after removing per-frame state publication, the input-restart count remained unchanged while a real soft-keyboard tap produced `setComposingText("a")`, and a real spacebar tap produced `finishComposingText` plus `commitText`;
 - those IME-originated edits did not cause Waker to publish another GameTextInput state reset;
 - backgrounding Waker destroyed its GameActivity surface; bringing it forward recreated a drawable surface in the same process;
 - Back genuinely finished the Waker Activity and exited that `android_main()`; relaunch created a fresh Activity/window/surface in the same retained PID;

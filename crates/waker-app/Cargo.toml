@@ -25,15 +25,15 @@ waker-net = { path = "../waker-net" }
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 eframe.workspace = true
-winit.workspace = true
 
 [target.'cfg(target_os = "android")'.dependencies]
 android-activity = { version = "0.6.1", features = ["game-activity"] }
 egui-wgpu = "0.36.2"
 jni = "0.22.4"
+# android-activity disables ndk's default features; Waker needs rwh_06 for ANativeWindow handles.
+ndk = { version = "0.9.0", default-features = false, features = ["rwh_06"] }
 pollster = "0.4.0"
 raw-window-handle = "0.6.2"
-ndk = { version = "0.9.0", default-features = false, features = ["rwh_06"] }
 tracing-logcat = "0.1.0"
 
 [package.metadata.android]

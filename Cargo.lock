@@ -3288,7 +3288,6 @@ dependencies = [
  "tracing-subscriber",
  "waker-core",
  "waker-net",
- "winit",
 ]
 
 [[package]]
