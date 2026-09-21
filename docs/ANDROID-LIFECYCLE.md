@@ -32,6 +32,20 @@ The dependency behaviour explained both failures:
 
 Rather than maintain a private winit fork for fundamental Android lifecycle semantics, Waker owns the small Android adapter directly. This decision is Android-specific; desktop Waker continues to use eframe/winit.
 
+## Historical provenance and reuse
+
+The direct Android platform layer was chosen during real-device Waker debugging on 11 September 2026, not because eframe lacked Android support and not to obtain a custom repaint waker. Archived development transcripts recovered on 21 September confirm the sequence:
+
+- Waker was using eframe/winit on Android when the lifecycle failures above were reproduced.
+- A local winit experiment that exited on `MainEvent::Destroy` fixed the retained zombie Activity, but immediately exposed winit's one-event-loop-per-process restriction on the next Activity.
+- The user then explicitly questioned whether winit was a sound Android foundation after two major lifecycle failures.
+- The recorded decision was to keep eframe/winit on desktop and replace only the Android platform layer with direct `android-activity + egui + egui-wgpu/wgpu`.
+- NativeActivity was used first; GameActivity was adopted later for its proper GameTextInput/InputConnection support while retaining direct lifecycle ownership.
+
+This history matters because the project name **Waker** can otherwise be confused with Android's `AndroidAppWaker`. Repaint waking was not the reason for removing winit.
+
+ChatGPT Rust deliberately inherited this architecture on 15 September 2026. Its Android implementation work explicitly used Waker's Android support and this lifecycle document as the reference, resulting in the same `GameActivity -> android-activity -> egui -> egui-wgpu -> wgpu` platform shell. If either project later considers returning to eframe/winit on Android, re-evaluate the Activity Destroy/recreation and sequential-event-loop behavior first rather than assuming the original decision was merely historical preference.
+
 ## Why GameActivity instead of NativeActivity
 
 The first direct backend used `android.app.NativeActivity`. Its lifecycle worked correctly once winit was removed, and that version passed surface recreation, Activity recreation, lock/unlock, fold/unfold, touch and log-viewer tests.
